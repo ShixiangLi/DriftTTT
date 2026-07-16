@@ -1,0 +1,53 @@
+experiment:
+  name: fd002_ttt
+  output_dir: outputs/fd002_ttt
+
+data:
+  data_dir: dataset/cmapss
+  subset: FD002
+  window_size: 256
+  stride: 1
+  rul_cap: 125.0
+  val_fraction: 0.2
+  variance_threshold: 1.0e-12
+  split_seed: 42
+
+model:
+  type: ttt
+  d_model: 64
+  num_layers: 2
+  num_heads: 4
+  ffn_ratio: 4.0
+  dropout: 0.1
+  ttt:
+    qkv_bias: true
+    inner_lr: 1.0
+    inner_scale: 0.3333333333333333
+    cpe_kernel_size: 3
+
+training:
+  batch_size: 64
+  epochs: 50
+  patience: 10
+  min_delta: 0.0
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  seed: 42
+  device: auto
+  num_workers: 0
+  deterministic: true
+  plots: true
+  resume: null
+  max_train_batches: null
+  max_val_batches: null
+
+evaluation:
+  checkpoint: null
+  device: auto
+  num_workers: 0
+  max_test_engines: null
+  output: null
+  predictions_output: null
+  plot_output: null
+  plots: true
