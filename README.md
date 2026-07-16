@@ -1,9 +1,10 @@
 # DriftTTT
 
 An independent PyTorch project for remaining useful life (RUL) prediction on
-NASA C-MAPSS. It supports both the temporal TTT layer adapted from the local
-`ViTTT/` reference source and a standard self-attention Transformer, without
-importing that project at runtime.
+NASA C-MAPSS and N-CMAPSS. It supports both the temporal TTT layer adapted from
+the local `ViTTT/` reference source and a standard self-attention Transformer,
+without importing that project at runtime. Dataset adapters share the model,
+training, checkpoint, metrics, complexity, and visualization pipeline.
 
 ## Upstream TTT analysis
 
@@ -113,7 +114,43 @@ model features. The 21 standard sensor fields are:
    call prevents future stateful implementations from leaking across engines.
 
 NASA Score uses `d=prediction-target`: under-prediction contributes
-`exp(-d/13)-1`, over-prediction contributes `exp(d/10)-1`, summed over engines.
+`exp(-d/13)-1`, over-prediction contributes `exp(d/10)-1`, summed over evaluated
+predictions.
+
+## N-CMAPSS
+
+N-CMAPSS adapters read one `N-CMAPSS_DS*.h5` file lazily. The default observed
+features are the four scenario descriptors in `W` plus the 14 measurements in
+`X_s`. `X_v` can be enabled explicitly. The unobservable health parameters in
+`T` are rejected as model features to prevent degradation-state leakage.
+
+The official `dev` units are split into disjoint train/validation units and the
+official `test` units are never used for preprocessing. Feature variances and
+normalization statistics are fitted sequentially from training-unit HDF5
+chunks. Window indices contain only compact unit spans and cumulative counts;
+individual feature windows are loaded on demand. HDF5 files are schema-checked
+before training, including aligned row counts and required variable names.
+
+Unlike classic C-MAPSS endpoint testing, N-CMAPSS supplies full test
+run-to-failure trajectories and one RUL label per 1 Hz sample. Its default
+evaluation protocol therefore scores all test windows and streams predictions
+to JSON Lines instead of retaining millions of records in memory.
+
+Training-only degradation-stage filtering is label based, never row-count
+based. For each training entity, `effective_rul / max_effective_rul` is used:
+
+```yaml
+data:
+  train_rul_filter:
+    enabled: true
+    normalized_range: [0.0, 0.7]
+```
+
+This retains the RUL interval closest to failure through 70% of the entity's
+effective label range. With a C-MAPSS cap of 125, it retains RUL 0 through 87.5
+and excludes the capped 125 plateau. Validation and test trajectories always
+remain complete. Set `[0.3, 1.0]` for the earlier-life label range or disable
+the filter to preserve the original behavior.
 
 ## Setup
 
@@ -123,7 +160,13 @@ From this repository root:
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Or use any Python 3.10+ environment with the packages in `requirements.txt`.
+For an editable install from the direct dependencies in `pyproject.toml`:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e .
+```
+
+Or use any Python 3.10+ environment with the declared dependencies.
 
 ## Train
 
@@ -131,11 +174,18 @@ Training and evaluation accept one required YAML configuration and no individual
 hyperparameter flags. Reference configurations are provided for both models:
 
 ```powershell
-.\.venv\Scripts\python.exe -m scripts.train --config configs\fd001_ttt.yaml
+.\.venv\Scripts\python.exe -m scripts.train --config configs\cmapss_ttt.yaml
 ```
 
 ```powershell
-.\.venv\Scripts\python.exe -m scripts.train --config configs\fd001_transformer.yaml
+.\.venv\Scripts\python.exe -m scripts.train --config configs\cmapss_transformer.yaml
+```
+
+N-CMAPSS reference runs:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.train --config configs\ncmapss_ttt.yaml
+.\.venv\Scripts\python.exe -m scripts.train --config configs\ncmapss_transformer.yaml
 ```
 
 The YAML sections are:
@@ -143,7 +193,8 @@ The YAML sections are:
 | Section | Contents |
 | --- | --- |
 | `experiment` | Run name and output directory |
-| `data` | Subset, window, RUL cap, validation fraction, split seed |
+| `data` | Adapter name, subset, window, RUL cap/filter, validation and sampling |
+| `data.options` | Dataset-specific feature groups, downsampling and boundaries |
 | `model` | Model type, width, depth, heads, FFN ratio, dropout |
 | `model.ttt` | qkv bias, inner learning rate, inner scale, CPE kernel |
 | `training` | Optimizer, epochs, early stop, initialization seed, runtime limits |
@@ -159,6 +210,12 @@ and visualizations. The standard variant uses dynamic sinusoidal positions and
 PyTorch pre-norm `TransformerEncoderLayer`; TTT uses CPE plus the ViTTT-derived
 layer. TTT-only settings live under `model.ttt` and are rejected for a standard
 Transformer configuration.
+
+`data.name` selects `cmapss` or `ncmapss`; older C-MAPSS YAML files without this
+field default to `cmapss`. `data.stride` controls training/validation endpoints,
+while `data.evaluation_stride` independently controls full-trajectory testing.
+For N-CMAPSS, `evaluation.max_test_batches` is available for smoke tests;
+partial metrics are not benchmark-comparable.
 
 Copy a reference YAML and change `data.subset` and `experiment.output_dir` for
 FD002, FD003, or FD004. With `evaluation.checkpoint: null`, evaluation uses
@@ -176,7 +233,8 @@ as a resumed run, not bitwise-identical to an uninterrupted run.
 ## Evaluate
 
 ```powershell
-.\.venv\Scripts\python.exe -m scripts.evaluate --config configs\fd001_ttt.yaml
+.\.venv\Scripts\python.exe -m scripts.evaluate --config configs\cmapss_ttt.yaml
+.\.venv\Scripts\python.exe -m scripts.evaluate --config configs\ncmapss_ttt.yaml
 ```
 
 The training and evaluation commands also print parameter count and analytical
@@ -190,7 +248,7 @@ disable automatic PNG generation.
 Plots can also be regenerated from saved JSON files:
 
 ```powershell
-.\.venv\Scripts\python.exe -m scripts.visualize --run-dir outputs\fd001
+.\.venv\Scripts\python.exe -m scripts.visualize --run-dir outputs\fd002_ttt
 ```
 
 Each training output directory contains:
@@ -201,7 +259,8 @@ last.pt                 latest checkpoint, including optimizer state
 config.yaml             normalized configuration used by the run
 history.json            per-epoch train/validation metrics
 test_metrics.json       endpoint test metrics and label policy
-test_predictions.json   engine ID, endpoint cycle, target, prediction
+test_predictions.json   endpoint predictions for C-MAPSS
+test_predictions.jsonl  streamed full-trajectory predictions for N-CMAPSS
 training_history.png    training and validation loss/RMSE curves
 test_predictions.png    endpoint trend and prediction parity plot
 ```
@@ -231,10 +290,16 @@ head width `D=C/H`:
 
 ```text
 data/
+  base.py               shared adapter, bundle, evaluation, and RUL-filter contracts
+  registry.py           explicit dataset adapter registry
+  preprocessing.py      streaming feature variance and normalization state
   cmapss.py             parsing, split, scaling, RUL, windows
+  ncmapss.py            lazy HDF5 schema, preprocessing, splits, and windows
 configs/
-  fd001_ttt.yaml        FD001 TTT experiment
-  fd001_transformer.yaml FD001 standard Transformer experiment
+  cmapss_ttt.yaml       C-MAPSS TTT experiment
+  cmapss_transformer.yaml C-MAPSS standard Transformer experiment
+  ncmapss_ttt.yaml      N-CMAPSS TTT experiment
+  ncmapss_transformer.yaml N-CMAPSS standard Transformer experiment
 models/
   ttt_layer.py          ViTTT-derived temporal TTT layer
   rul_transformer.py    shared RUL backbone, TTT and standard Transformer blocks

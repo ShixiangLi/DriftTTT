@@ -3,14 +3,20 @@ experiment:
   output_dir: outputs/fd002_transformer
 
 data:
+  name: cmapss
   data_dir: dataset/cmapss
   subset: FD002
-  window_size: 256
+  window_size: 128
   stride: 1
+  evaluation_stride: 1
   rul_cap: 125.0
   val_fraction: 0.2
   variance_threshold: 1.0e-12
   split_seed: 42
+  train_rul_filter:
+    enabled: false
+    normalized_range: [0.0, 0.7]
+  options: {}
 
 model:
   type: transformer
@@ -41,7 +47,9 @@ evaluation:
   checkpoint: null
   device: auto
   num_workers: 0
+  batch_size: null
   max_test_engines: null
+  max_test_batches: null
   output: null
   predictions_output: null
   plot_output: null

@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 
 import yaml
 
+from data.base import RulStageFilter
 
-_SUBSETS = {"FD001", "FD002", "FD003", "FD004"}
 _MODEL_TYPES = {"ttt", "transformer"}
 _T = TypeVar("_T")
 
@@ -76,20 +76,30 @@ class ExperimentSettings:
 class DataSettings:
     data_dir: str | Path
     subset: str
+    name: str = "cmapss"
     window_size: int = 30
     stride: int = 1
+    evaluation_stride: int = 1
     rul_cap: float | None = 125.0
     val_fraction: float = 0.2
     variance_threshold: float = 1e-12
     split_seed: int = 42
+    train_rul_filter: RulStageFilter | dict[str, Any] | None = None
+    options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.data_dir = _path(self.data_dir, "data.data_dir")  # type: ignore[assignment]
-        self.subset = str(self.subset).upper()
-        if self.subset not in _SUBSETS:
-            raise ValueError(f"data.subset must be one of {sorted(_SUBSETS)}.")
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("data.name must be a non-empty string.")
+        self.name = self.name.strip().lower()
+        if not isinstance(self.subset, str) or not self.subset.strip():
+            raise ValueError("data.subset must be a non-empty string.")
+        self.subset = self.subset.strip().upper()
         self.window_size = _integer(self.window_size, "data.window_size", minimum=1)
         self.stride = _integer(self.stride, "data.stride", minimum=1)
+        self.evaluation_stride = _integer(
+            self.evaluation_stride, "data.evaluation_stride", minimum=1
+        )
         if self.rul_cap is not None:
             self.rul_cap = _finite(self.rul_cap, "data.rul_cap")
             if self.rul_cap <= 0:
@@ -103,17 +113,31 @@ class DataSettings:
         if self.variance_threshold < 0:
             raise ValueError("data.variance_threshold cannot be negative.")
         self.split_seed = _integer(self.split_seed, "data.split_seed")
+        if self.train_rul_filter is None:
+            self.train_rul_filter = RulStageFilter()
+        elif isinstance(self.train_rul_filter, dict):
+            self.train_rul_filter = _build(
+                RulStageFilter, self.train_rul_filter, "data.train_rul_filter"
+            )
+        elif not isinstance(self.train_rul_filter, RulStageFilter):
+            raise ValueError("data.train_rul_filter must be a mapping.")
+        if not isinstance(self.options, dict):
+            raise ValueError("data.options must be a mapping.")
 
     def checkpoint_values(self) -> dict[str, Any]:
         return {
+            "name": self.name,
             "data_dir": str(Path(self.data_dir).resolve()),
             "subset": self.subset,
             "window_size": self.window_size,
             "stride": self.stride,
+            "evaluation_stride": self.evaluation_stride,
             "val_fraction": self.val_fraction,
             "seed": self.split_seed,
             "rul_cap": self.rul_cap,
             "variance_threshold": self.variance_threshold,
+            "train_rul_filter": self.train_rul_filter.to_dict(),
+            "options": dict(self.options),
         }
 
 
@@ -224,9 +248,7 @@ class TrainingSettings:
         self.seed = _integer(self.seed, "training.seed")
         if not isinstance(self.device, str) or not self.device:
             raise ValueError("training.device must be a non-empty string.")
-        self.num_workers = _integer(
-            self.num_workers, "training.num_workers", minimum=0
-        )
+        self.num_workers = _integer(self.num_workers, "training.num_workers", minimum=0)
         self.deterministic = _boolean(self.deterministic, "training.deterministic")
         self.plots = _boolean(self.plots, "training.plots")
         self.resume = _path(self.resume, "training.resume", optional=True)
@@ -243,23 +265,27 @@ class EvaluationSettings:
     checkpoint: str | Path | None = None
     device: str = "auto"
     num_workers: int = 0
+    batch_size: int | None = None
     max_test_engines: int | None = None
+    max_test_batches: int | None = None
     output: str | Path | None = None
     predictions_output: str | Path | None = None
     plot_output: str | Path | None = None
     plots: bool = True
 
     def __post_init__(self) -> None:
-        self.checkpoint = _path(
-            self.checkpoint, "evaluation.checkpoint", optional=True
-        )
+        self.checkpoint = _path(self.checkpoint, "evaluation.checkpoint", optional=True)
         if not isinstance(self.device, str) or not self.device:
             raise ValueError("evaluation.device must be a non-empty string.")
         self.num_workers = _integer(
             self.num_workers, "evaluation.num_workers", minimum=0
         )
+        self.batch_size = _optional_positive(self.batch_size, "evaluation.batch_size")
         self.max_test_engines = _optional_positive(
             self.max_test_engines, "evaluation.max_test_engines"
+        )
+        self.max_test_batches = _optional_positive(
+            self.max_test_batches, "evaluation.max_test_batches"
         )
         self.output = _path(self.output, "evaluation.output", optional=True)
         self.predictions_output = _path(
@@ -283,7 +309,11 @@ class ExperimentConfig:
     @property
     def evaluation_checkpoint(self) -> Path:
         checkpoint = self.evaluation.checkpoint
-        return Path(checkpoint) if checkpoint else Path(self.experiment.output_dir) / "best.pt"
+        return (
+            Path(checkpoint)
+            if checkpoint
+            else Path(self.experiment.output_dir) / "best.pt"
+        )
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
@@ -294,7 +324,7 @@ class ExperimentConfig:
                 return str(value)
             if isinstance(value, dict):
                 return {key: native(item) for key, item in value.items()}
-            if isinstance(value, list):
+            if isinstance(value, (list, tuple)):
                 return [native(item) for item in value]
             return value
 
@@ -330,24 +360,6 @@ class ExperimentConfig:
                 raise ValueError(
                     f"Configured model.{key} does not match checkpoint: "
                     f"{expected!r} != {actual_model_config[key]!r}."
-                )
-        actual_data = checkpoint.get("data_config")
-        if not isinstance(actual_data, dict):
-            raise ValueError("Checkpoint is missing data_config.")
-        expected_data = self.data.checkpoint_values()
-        for key in (
-            "subset",
-            "window_size",
-            "stride",
-            "val_fraction",
-            "seed",
-            "rul_cap",
-            "variance_threshold",
-        ):
-            if actual_data.get(key) != expected_data[key]:
-                raise ValueError(
-                    f"Configured data.{key} does not match checkpoint: "
-                    f"{expected_data[key]!r} != {actual_data.get(key)!r}."
                 )
 
 

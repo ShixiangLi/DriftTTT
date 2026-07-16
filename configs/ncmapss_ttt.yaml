@@ -1,22 +1,26 @@
 experiment:
-  name: fd002_ttt
-  output_dir: outputs/fd002_ttt
+  name: ncmapss_ds02_ttt
+  output_dir: outputs/ncmapss_ds02_ttt
 
 data:
-  name: cmapss
-  data_dir: dataset/cmapss
-  subset: FD002
-  window_size: 128
-  stride: 1
+  name: ncmapss
+  data_dir: dataset/n-cmapss
+  subset: DS02-006
+  window_size: 256
+  stride: 64
   evaluation_stride: 1
-  rul_cap: 125.0
+  rul_cap: null
   val_fraction: 0.2
   variance_threshold: 1.0e-12
   split_seed: 42
   train_rul_filter:
-    enabled: false
+    enabled: true
     normalized_range: [0.0, 0.7]
-  options: {}
+  options:
+    feature_groups: [W, X_s]
+    downsample_factor: 1
+    window_boundary: unit
+    validation_units: null
 
 model:
   type: ttt
@@ -52,7 +56,7 @@ evaluation:
   checkpoint: null
   device: auto
   num_workers: 0
-  batch_size: null
+  batch_size: 64
   max_test_engines: null
   max_test_batches: null
   output: null

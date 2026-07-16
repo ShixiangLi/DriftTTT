@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -20,6 +20,14 @@ import torch
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset
+
+from .base import (
+    DataBundle,
+    EvaluationBundle,
+    EvaluationSpec,
+    RulStageFilter,
+    rul_stage_mask,
+)
 
 
 ENGINE_ID_COLUMN = "engine_id"
@@ -128,8 +136,7 @@ def map_test_rul_to_engines(
 
     _require_columns(test_frame, (ENGINE_ID_COLUMN,))
     engine_ids = tuple(
-        int(value)
-        for value in np.sort(test_frame[ENGINE_ID_COLUMN].unique()).tolist()
+        int(value) for value in np.sort(test_frame[ENGINE_ID_COLUMN].unique()).tolist()
     )
     values = np.asarray(official_rul, dtype=np.float64).reshape(-1)
     if len(engine_ids) != values.size:
@@ -141,7 +148,9 @@ def map_test_rul_to_engines(
         raise ValueError("Cannot map RUL labels for an empty test frame.")
     if not np.isfinite(values).all() or (values < 0).any():
         raise ValueError("Official test RUL values must be finite and non-negative.")
-    return pd.Series(values, index=pd.Index(engine_ids, name=ENGINE_ID_COLUMN), name=RUL_COLUMN)
+    return pd.Series(
+        values, index=pd.Index(engine_ids, name=ENGINE_ID_COLUMN), name=RUL_COLUMN
+    )
 
 
 @dataclass(frozen=True)
@@ -154,7 +163,9 @@ class CmapssRawData:
     test_rul: pd.Series
 
 
-def load_cmapss_files(data_dir: str | Path, subset: str | int = "FD001") -> CmapssRawData:
+def load_cmapss_files(
+    data_dir: str | Path, subset: str | int = "FD001"
+) -> CmapssRawData:
     """Load one complete C-MAPSS subset from ``data_dir``."""
 
     subset_name = normalize_subset(subset)
@@ -308,7 +319,9 @@ class CmapssPreprocessor:
         if not self.feature_columns or len(set(self.feature_columns)) != len(
             self.feature_columns
         ):
-            raise ValueError("feature_columns must be a non-empty list of unique names.")
+            raise ValueError(
+                "feature_columns must be a non-empty list of unique names."
+            )
 
         self.selected_indices: tuple[int, ...] = ()
         self.selected_features: tuple[str, ...] = ()
@@ -351,7 +364,9 @@ class CmapssPreprocessor:
         scaler.fit(values[:, selected])
 
         self.selected_indices = selected
-        self.selected_features = tuple(self.feature_columns[index] for index in selected)
+        self.selected_features = tuple(
+            self.feature_columns[index] for index in selected
+        )
         self.feature_variances = tuple(float(value) for value in selector.variances_)
         self.n_samples_seen = int(values.shape[0])
         if ENGINE_ID_COLUMN in frame:
@@ -402,7 +417,9 @@ class CmapssPreprocessor:
         """Restore a state produced by :meth:`state_dict`."""
 
         if int(state.get("version", -1)) != self.STATE_VERSION:
-            raise ValueError(f"Unsupported preprocessing state version: {state.get('version')}")
+            raise ValueError(
+                f"Unsupported preprocessing state version: {state.get('version')}"
+            )
         feature_columns = tuple(str(value) for value in state["feature_columns"])
         selected_indices = tuple(int(value) for value in state["selected_indices"])
         selected_features = tuple(str(value) for value in state["selected_features"])
@@ -504,6 +521,7 @@ class WindowedCmapssDataset(Dataset):
         window_size: int = 30,
         stride: int = 1,
         last_only: bool = False,
+        include_partial: bool = False,
     ) -> None:
         if window_size <= 0:
             raise ValueError("window_size must be positive.")
@@ -515,6 +533,7 @@ class WindowedCmapssDataset(Dataset):
         self.window_size = int(window_size)
         self.stride = int(stride)
         self.last_only = bool(last_only)
+        self.include_partial = bool(include_partial)
         self.feature_names = preprocessor.selected_features
         self.feature_dim = preprocessor.output_dim
         self._sequences: list[_EngineSequence] = []
@@ -524,30 +543,44 @@ class WindowedCmapssDataset(Dataset):
         for engine_id, engine_frame in frame.groupby(ENGINE_ID_COLUMN, sort=True):
             ordered = engine_frame.sort_values(CYCLE_COLUMN, kind="stable")
             if ordered[CYCLE_COLUMN].duplicated().any():
-                raise ValueError(f"Engine {engine_id} contains duplicate cycle numbers.")
+                raise ValueError(
+                    f"Engine {engine_id} contains duplicate cycle numbers."
+                )
             features = np.ascontiguousarray(preprocessor.transform(ordered))
             targets = ordered[RUL_COLUMN].to_numpy(dtype=np.float32, copy=True)
             cycles = ordered[CYCLE_COLUMN].to_numpy(dtype=np.int64, copy=True)
             if not np.isfinite(targets).all():
-                raise ValueError(f"Engine {engine_id} contains a non-finite RUL target.")
+                raise ValueError(
+                    f"Engine {engine_id} contains a non-finite RUL target."
+                )
 
             sequence_index = len(self._sequences)
             numeric_engine_id = int(engine_id)
             self._sequences.append(
                 _EngineSequence(numeric_engine_id, features, targets, cycles)
             )
-            if self.last_only or len(ordered) < self.window_size:
+            if self.last_only:
+                endpoints = (len(ordered) - 1,)
+            elif self.include_partial:
+                endpoint_values = list(range(0, len(ordered), self.stride))
+                if endpoint_values[-1] != len(ordered) - 1:
+                    endpoint_values.append(len(ordered) - 1)
+                endpoints = endpoint_values
+            elif len(ordered) < self.window_size:
                 endpoints = (len(ordered) - 1,)
             else:
                 endpoints = range(self.window_size - 1, len(ordered), self.stride)
             for endpoint in endpoints:
                 sample_position = len(self._sample_index)
                 self._sample_index.append((sequence_index, int(endpoint)))
-                engine_to_indices.setdefault(numeric_engine_id, []).append(sample_position)
+                engine_to_indices.setdefault(numeric_engine_id, []).append(
+                    sample_position
+                )
 
         self.engine_ids = tuple(sequence.engine_id for sequence in self._sequences)
         self._engine_to_indices = {
-            engine_id: tuple(indices) for engine_id, indices in engine_to_indices.items()
+            engine_id: tuple(indices)
+            for engine_id, indices in engine_to_indices.items()
         }
 
     def __len__(self) -> int:
@@ -572,6 +605,8 @@ class WindowedCmapssDataset(Dataset):
             "features": torch.from_numpy(np.ascontiguousarray(window)),
             "padding_mask": torch.from_numpy(padding_mask),
             "target": torch.tensor(sequence.targets[endpoint], dtype=torch.float32),
+            "entity_id": torch.tensor(sequence.engine_id, dtype=torch.long),
+            "time_index": torch.tensor(sequence.cycles[endpoint], dtype=torch.long),
             "engine_id": torch.tensor(sequence.engine_id, dtype=torch.long),
             "cycle": torch.tensor(sequence.cycles[endpoint], dtype=torch.long),
         }
@@ -603,6 +638,7 @@ class CmapssDataBundle:
     preprocessor: CmapssPreprocessor
     train_engine_ids: tuple[int, ...]
     val_engine_ids: tuple[int, ...]
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def train(self) -> WindowedCmapssDataset:
@@ -658,6 +694,7 @@ def prepare_cmapss_datasets(
     rul_cap: float | None = 125.0,
     variance_threshold: float = 1e-12,
     preprocessor: CmapssPreprocessor | None = None,
+    train_rul_filter: RulStageFilter | None = None,
 ) -> CmapssDataBundle:
     """Build leakage-safe train, validation, and official test datasets.
 
@@ -679,6 +716,14 @@ def prepare_cmapss_datasets(
         labelled_train[ENGINE_ID_COLUMN].isin(val_ids)
     ].reset_index(drop=True)
 
+    active_filter = train_rul_filter or RulStageFilter()
+    train_mask, filter_metadata = rul_stage_mask(
+        train_frame[ENGINE_ID_COLUMN].to_numpy(dtype=np.int64),
+        train_frame[RUL_COLUMN].to_numpy(dtype=np.float64),
+        active_filter,
+    )
+    train_frame = train_frame.loc[train_mask].reset_index(drop=True)
+
     if preprocessor is None:
         active_preprocessor = CmapssPreprocessor(
             variance_threshold=variance_threshold
@@ -697,7 +742,11 @@ def prepare_cmapss_datasets(
     labelled_test = add_test_rul_labels(raw.test, raw.test_rul, rul_cap=rul_cap)
 
     train_dataset = WindowedCmapssDataset(
-        train_frame, active_preprocessor, window_size=window_size, stride=stride
+        train_frame,
+        active_preprocessor,
+        window_size=window_size,
+        stride=stride,
+        include_partial=active_filter.enabled,
     )
     val_dataset = WindowedCmapssDataset(
         val_frame, active_preprocessor, window_size=window_size, stride=stride
@@ -717,11 +766,156 @@ def prepare_cmapss_datasets(
         preprocessor=active_preprocessor,
         train_engine_ids=train_ids,
         val_engine_ids=val_ids,
+        metadata={"train_rul_filter": filter_metadata},
     )
 
 
 # Backwards-friendly singular spelling for small scripts.
 prepare_cmapss_data = prepare_cmapss_datasets
+
+
+class CmapssAdapter:
+    """Expose the existing C-MAPSS pipeline through the shared data contract."""
+
+    name = "cmapss"
+
+    @staticmethod
+    def _validate_settings(settings: Any) -> None:
+        normalize_subset(settings.subset)
+        if settings.options:
+            raise ValueError(
+                f"C-MAPSS does not define data.options; got {sorted(settings.options)}."
+            )
+
+    def checkpoint_config(self, settings: Any) -> dict[str, Any]:
+        self._validate_settings(settings)
+        values = settings.checkpoint_values()
+        values["name"] = self.name
+        values["subset"] = normalize_subset(settings.subset)
+        return values
+
+    def validate_checkpoint(self, settings: Any, checkpoint: Mapping[str, Any]) -> None:
+        expected = self.checkpoint_config(settings)
+        actual = checkpoint.get("data_config")
+        if not isinstance(actual, Mapping):
+            raise ValueError("Checkpoint is missing data_config.")
+        actual_name = str(
+            checkpoint.get("dataset_name", actual.get("name", "cmapss"))
+        ).lower()
+        if actual_name != self.name:
+            raise ValueError(
+                f"Configured dataset {self.name!r} does not match checkpoint "
+                f"dataset {actual_name!r}."
+            )
+        defaults = {
+            "evaluation_stride": 1,
+            "train_rul_filter": RulStageFilter().to_dict(),
+            "options": {},
+        }
+        for key in (
+            "subset",
+            "window_size",
+            "stride",
+            "evaluation_stride",
+            "val_fraction",
+            "seed",
+            "rul_cap",
+            "variance_threshold",
+            "train_rul_filter",
+            "options",
+        ):
+            found = actual.get(key, defaults.get(key))
+            if found != expected[key]:
+                raise ValueError(
+                    f"Configured data.{key} does not match checkpoint: "
+                    f"{expected[key]!r} != {found!r}."
+                )
+
+    @staticmethod
+    def _label_policy(rul_cap: float | None) -> dict[str, Any]:
+        return {
+            "train": "piecewise_linear_to_failure",
+            "test": "official_endpoint_rul",
+            "cap_applied_to": "train_and_test_targets"
+            if rul_cap is not None
+            else "none",
+        }
+
+    def prepare_training(
+        self,
+        settings: Any,
+        preprocessor_state: Mapping[str, Any] | None = None,
+    ) -> DataBundle:
+        data_config = self.checkpoint_config(settings)
+        restored = (
+            CmapssPreprocessor.from_state_dict(preprocessor_state)
+            if preprocessor_state is not None
+            else None
+        )
+        bundle = prepare_cmapss_datasets(
+            data_dir=settings.data_dir,
+            subset=settings.subset,
+            window_size=settings.window_size,
+            stride=settings.stride,
+            val_fraction=settings.val_fraction,
+            seed=settings.split_seed,
+            rul_cap=settings.rul_cap,
+            variance_threshold=settings.variance_threshold,
+            preprocessor=restored,
+            train_rul_filter=settings.train_rul_filter,
+        )
+        splits = {
+            "train": bundle.train_engine_ids,
+            "val": bundle.val_engine_ids,
+            "test": bundle.test_dataset.engine_ids,
+        }
+        return DataBundle(
+            dataset_name=self.name,
+            subset=bundle.subset,
+            train_dataset=bundle.train_dataset,
+            val_dataset=bundle.val_dataset,
+            test_dataset=bundle.test_dataset,
+            preprocessor=bundle.preprocessor,
+            split_entity_ids=splits,
+            evaluation_spec=EvaluationSpec(
+                protocol="endpoint_per_entity",
+                batch_size=1,
+                reset_each_batch=True,
+                require_single_item=True,
+            ),
+            data_config=data_config,
+            label_policy=self._label_policy(settings.rul_cap),
+            metadata=bundle.metadata,
+        )
+
+    def prepare_evaluation(
+        self,
+        settings: Any,
+        preprocessor_state: Mapping[str, Any],
+    ) -> EvaluationBundle:
+        data_config = self.checkpoint_config(settings)
+        preprocessor = CmapssPreprocessor.from_state_dict(preprocessor_state)
+        dataset = prepare_cmapss_test_dataset(
+            data_dir=settings.data_dir,
+            subset=settings.subset,
+            preprocessor=preprocessor,
+            window_size=settings.window_size,
+            rul_cap=settings.rul_cap,
+        )
+        return EvaluationBundle(
+            dataset_name=self.name,
+            subset=normalize_subset(settings.subset),
+            test_dataset=dataset,
+            preprocessor=preprocessor,
+            evaluation_spec=EvaluationSpec(
+                protocol="endpoint_per_entity",
+                batch_size=1,
+                reset_each_batch=True,
+                require_single_item=True,
+            ),
+            data_config=data_config,
+            label_policy=self._label_policy(settings.rul_cap),
+        )
 
 
 __all__ = [
@@ -740,6 +934,7 @@ __all__ = [
     "WindowedCmapssDataset",
     "CmapssWindowDataset",
     "CmapssDataBundle",
+    "CmapssAdapter",
     "normalize_subset",
     "read_cmapss_data",
     "read_cmapss_rul",

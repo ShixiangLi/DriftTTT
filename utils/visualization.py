@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,26 @@ def _load_json(source: JsonSource) -> Any:
             raise FileNotFoundError(f"Visualization input not found: {path}")
         return json.loads(path.read_text(encoding="utf-8"))
     return source
+
+
+def _load_prediction_records(source: JsonSource, limit: int = 5000) -> Any:
+    if not isinstance(source, (str, Path)) or Path(source).suffix.lower() != ".jsonl":
+        return _load_json(source)
+    path = Path(source)
+    if not path.is_file():
+        raise FileNotFoundError(f"Visualization input not found: {path}")
+    rng = random.Random(0)
+    reservoir: list[Mapping[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for index, line in enumerate(handle):
+            record = json.loads(line)
+            if index < limit:
+                reservoir.append(record)
+            else:
+                replacement = rng.randint(0, index)
+                if replacement < limit:
+                    reservoir[replacement] = record
+    return reservoir
 
 
 def _pyplot() -> Any:
@@ -73,12 +94,16 @@ def plot_training_history(
 
     plt = _pyplot()
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), constrained_layout=True)
-    axes[0].plot(epochs, train_loss, label="Train", linewidth=2, marker="o", markersize=4)
+    axes[0].plot(
+        epochs, train_loss, label="Train", linewidth=2, marker="o", markersize=4
+    )
     axes[0].plot(
         epochs, val_loss, label="Validation", linewidth=2, marker="o", markersize=4
     )
     axes[0].set(title="MSE Loss", xlabel="Epoch", ylabel="MSE")
-    axes[1].plot(epochs, train_rmse, label="Train", linewidth=2, marker="o", markersize=4)
+    axes[1].plot(
+        epochs, train_rmse, label="Train", linewidth=2, marker="o", markersize=4
+    )
     axes[1].plot(
         epochs, val_rmse, label="Validation", linewidth=2, marker="o", markersize=4
     )
@@ -97,14 +122,19 @@ def plot_rul_predictions(
     output_path: str | Path,
 ) -> Path:
     """Plot endpoint predictions by engine and as a target/prediction parity plot."""
-    records = _load_json(predictions)
+    records = _load_prediction_records(predictions)
     if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
         raise ValueError("Predictions must be a sequence of records.")
     if not records:
         raise ValueError("Predictions are empty.")
 
-    ordered = sorted(records, key=lambda row: int(row["engine_id"]))
-    engine_ids = np.asarray([int(row["engine_id"]) for row in ordered])
+    entity_key = "engine_id" if "engine_id" in records[0] else "entity_id"
+    time_key = "cycle" if "cycle" in records[0] else "time_index"
+    ordered = sorted(
+        records,
+        key=lambda row: (int(row[entity_key]), int(row.get(time_key, 0))),
+    )
+    entity_ids = np.asarray([int(row[entity_key]) for row in ordered])
     targets = np.asarray([float(row["target"]) for row in ordered], dtype=np.float64)
     predicted = np.asarray(
         [float(row["prediction"]) for row in ordered], dtype=np.float64
@@ -122,9 +152,18 @@ def plot_rul_predictions(
 
     plt = _pyplot()
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), constrained_layout=True)
-    axes[0].plot(engine_ids, targets, label="Target", linewidth=1.8)
-    axes[0].plot(engine_ids, predicted, label="Prediction", linewidth=1.5)
-    axes[0].set(title="Endpoint RUL by Engine", xlabel="Engine ID", ylabel="RUL")
+    x_values = (
+        entity_ids
+        if np.unique(entity_ids).size == len(entity_ids)
+        else np.arange(len(ordered))
+    )
+    axes[0].plot(x_values, targets, label="Target", linewidth=1.3)
+    axes[0].plot(x_values, predicted, label="Prediction", linewidth=1.1)
+    if np.unique(entity_ids).size == len(entity_ids):
+        title, xlabel = "Endpoint RUL by Entity", "Entity ID"
+    else:
+        title, xlabel = "RUL Prediction Samples", "Sample"
+    axes[0].set(title=title, xlabel=xlabel, ylabel="RUL")
     axes[0].grid(alpha=0.25)
     axes[0].legend(frameon=False)
 
@@ -159,6 +198,8 @@ def create_run_visualizations(
             plot_training_history(history_path, destination / "training_history.png")
         )
     predictions_path = run_path / "test_predictions.json"
+    if not predictions_path.is_file():
+        predictions_path = run_path / "test_predictions.jsonl"
     if predictions_path.is_file():
         outputs.append(
             plot_rul_predictions(predictions_path, destination / "test_predictions.png")
