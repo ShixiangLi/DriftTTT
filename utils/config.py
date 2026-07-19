@@ -12,6 +12,8 @@ import yaml
 from data.base import RulStageFilter
 
 _MODEL_TYPES = {"ttt", "transformer"}
+_MODEL_ARCHITECTURES = {"encoder", "decoder"}
+_PRECISIONS = {"auto", "fp32", "bf16"}
 _T = TypeVar("_T")
 
 
@@ -147,6 +149,8 @@ class TTTSettings:
     inner_lr: float = 1.0
     inner_scale: float = 1.0 / 3.0
     cpe_kernel_size: int = 3
+    chunk_size: int = 16
+    continuous_state: bool = False
 
     def __post_init__(self) -> None:
         self.qkv_bias = _boolean(self.qkv_bias, "model.ttt.qkv_bias")
@@ -159,22 +163,55 @@ class TTTSettings:
         )
         if self.cpe_kernel_size % 2 == 0:
             raise ValueError("model.ttt.cpe_kernel_size must be odd.")
+        self.chunk_size = _integer(
+            self.chunk_size, "model.ttt.chunk_size", minimum=1
+        )
+        self.continuous_state = _boolean(
+            self.continuous_state, "model.ttt.continuous_state"
+        )
+
+
+@dataclass
+class AutoregressiveSettings:
+    """Continuous next-step feature objective used by decoder models."""
+
+    enabled: bool = True
+    loss: str = "smooth_l1"
+    weight: float = 0.2
+
+    def __post_init__(self) -> None:
+        self.enabled = _boolean(self.enabled, "model.autoregressive.enabled")
+        self.loss = str(self.loss).strip().lower()
+        if self.loss not in {"mse", "smooth_l1"}:
+            raise ValueError(
+                "model.autoregressive.loss must be 'mse' or 'smooth_l1'."
+            )
+        self.weight = _finite(self.weight, "model.autoregressive.weight")
+        if self.weight <= 0:
+            raise ValueError("model.autoregressive.weight must be positive.")
 
 
 @dataclass
 class ModelSettings:
     type: str
+    architecture: str = "encoder"
     d_model: int = 64
     num_layers: int = 2
     num_heads: int = 4
     ffn_ratio: float = 4.0
     dropout: float = 0.1
     ttt: TTTSettings | dict[str, Any] | None = None
+    autoregressive: AutoregressiveSettings | dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.type = str(self.type).lower()
         if self.type not in _MODEL_TYPES:
             raise ValueError(f"model.type must be one of {sorted(_MODEL_TYPES)}.")
+        self.architecture = str(self.architecture).strip().lower()
+        if self.architecture not in _MODEL_ARCHITECTURES:
+            raise ValueError(
+                "model.architecture must be 'encoder' or 'decoder'."
+            )
         self.d_model = _integer(self.d_model, "model.d_model", minimum=1)
         self.num_layers = _integer(self.num_layers, "model.num_layers", minimum=1)
         self.num_heads = _integer(self.num_heads, "model.num_heads", minimum=1)
@@ -193,16 +230,48 @@ class ModelSettings:
                 raise ValueError("model.ttt must be a mapping.")
         elif self.ttt is not None:
             raise ValueError("model.ttt is only valid when model.type is 'ttt'.")
+        if self.autoregressive is None:
+            self.autoregressive = AutoregressiveSettings(
+                enabled=self.architecture == "decoder"
+            )
+        elif isinstance(self.autoregressive, dict):
+            self.autoregressive = _build(
+                AutoregressiveSettings,
+                self.autoregressive,
+                "model.autoregressive",
+            )
+        elif not isinstance(self.autoregressive, AutoregressiveSettings):
+            raise ValueError("model.autoregressive must be a mapping.")
+        if self.architecture == "encoder" and self.autoregressive.enabled:
+            raise ValueError(
+                "model.autoregressive.enabled requires model.architecture='decoder'."
+            )
+        if (
+            isinstance(self.ttt, TTTSettings)
+            and self.ttt.continuous_state
+            and self.architecture != "decoder"
+        ):
+            raise ValueError(
+                "model.ttt.continuous_state requires model.architecture='decoder'."
+            )
 
     def constructor_values(self, input_dim: int) -> dict[str, Any]:
         values: dict[str, Any] = {
             "input_dim": input_dim,
+            "architecture": self.architecture,
             "d_model": self.d_model,
             "num_layers": self.num_layers,
             "num_heads": self.num_heads,
             "ffn_ratio": self.ffn_ratio,
             "dropout": self.dropout,
         }
+        assert isinstance(self.autoregressive, AutoregressiveSettings)
+        if self.autoregressive.enabled:
+            values.update(
+                autoregressive=True,
+                autoregressive_loss=self.autoregressive.loss,
+                autoregressive_weight=self.autoregressive.weight,
+            )
         if self.type == "ttt":
             assert isinstance(self.ttt, TTTSettings)
             values.update(
@@ -211,6 +280,10 @@ class ModelSettings:
                 inner_scale=self.ttt.inner_scale,
                 cpe_kernel_size=self.ttt.cpe_kernel_size,
             )
+            if self.architecture == "decoder":
+                values["chunk_size"] = self.ttt.chunk_size
+            if self.ttt.continuous_state:
+                values["continuous_state"] = True
         return values
 
 
@@ -227,6 +300,8 @@ class TrainingSettings:
     device: str = "auto"
     num_workers: int = 0
     deterministic: bool = True
+    precision: str = "fp32"
+    compile: bool = False
     plots: bool = True
     resume: str | Path | None = None
     max_train_batches: int | None = None
@@ -250,6 +325,12 @@ class TrainingSettings:
             raise ValueError("training.device must be a non-empty string.")
         self.num_workers = _integer(self.num_workers, "training.num_workers", minimum=0)
         self.deterministic = _boolean(self.deterministic, "training.deterministic")
+        self.precision = str(self.precision).strip().lower()
+        if self.precision not in _PRECISIONS:
+            raise ValueError(
+                f"training.precision must be one of {sorted(_PRECISIONS)}."
+            )
+        self.compile = _boolean(self.compile, "training.compile")
         self.plots = _boolean(self.plots, "training.plots")
         self.resume = _path(self.resume, "training.resume", optional=True)
         self.max_train_batches = _optional_positive(
@@ -306,6 +387,13 @@ class ExperimentConfig:
     evaluation: EvaluationSettings
     source: Path
 
+    def __post_init__(self) -> None:
+        assert isinstance(self.model.autoregressive, AutoregressiveSettings)
+        if self.model.autoregressive.enabled and self.data.window_size < 2:
+            raise ValueError(
+                "data.window_size must be at least 2 for autoregressive training."
+            )
+
     @property
     def evaluation_checkpoint(self) -> Path:
         checkpoint = self.evaluation.checkpoint
@@ -355,6 +443,8 @@ class ExperimentConfig:
             if key not in actual_model_config:
                 if key == "inner_scale" and expected == 1.0 / 3.0:
                     continue  # Compatibility with checkpoints before this option existed.
+                if key == "architecture" and expected == "encoder":
+                    continue  # Compatibility with encoder checkpoints from format v1.
                 raise ValueError(f"Checkpoint model_config is missing {key!r}.")
             if actual_model_config[key] != expected:
                 raise ValueError(
@@ -388,6 +478,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
 
 
 __all__ = [
+    "AutoregressiveSettings",
     "DataSettings",
     "EvaluationSettings",
     "ExperimentConfig",

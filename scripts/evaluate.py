@@ -16,9 +16,11 @@ from utils.config import ExperimentConfig, load_experiment_config
 from utils.engine import (
     JsonlPredictionWriter,
     build_model,
+    compile_model,
     evaluate_dataset,
     load_checkpoint,
     resolve_device,
+    resolve_precision,
     save_json,
     seed_worker,
     set_seed,
@@ -54,6 +56,7 @@ def main() -> None:
 
     set_seed(config.training.seed, deterministic=config.training.deterministic)
     device = resolve_device(evaluation.device)
+    precision = resolve_precision(config.training.precision, device)
     bundle = adapter.prepare_evaluation(config.data, preprocessor_state)
     verify_test_provenance(bundle.test_dataset, bundle.preprocessor, checkpoint)
     if int(model_config.get("input_dim", -1)) != bundle.preprocessor.output_dim:
@@ -61,13 +64,29 @@ def main() -> None:
 
     model = build_model(model_name, model_config).to(device)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    compile_model(model, config.training.compile)
+    architecture = str(getattr(model, "architecture", "encoder"))
+    continuous_state = bool(getattr(model, "continuous_state", False))
+    test_dataset = bundle.test_dataset
+    if continuous_state:
+        continuous_view = getattr(test_dataset, "continuous_evaluation_view", None)
+        if callable(continuous_view):
+            test_dataset = continuous_view()
     model_complexity = estimate_model_complexity(model, config.data.window_size)
     print(format_model_complexity(model_complexity))
     generator = torch.Generator().manual_seed(config.training.seed)
     spec = bundle.evaluation_spec
     batch_size = evaluation.batch_size or spec.batch_size
+    if (
+        getattr(test_dataset, "requires_batch_size_one", False)
+        and batch_size != 1
+    ):
+        raise ValueError(
+            "continuous C-MAPSS trajectory evaluation requires batch_size=1"
+        )
+    worker_options = {"prefetch_factor": 4} if evaluation.num_workers else {}
     test_loader = DataLoader(
-        bundle.test_dataset,
+        test_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=evaluation.num_workers,
@@ -76,7 +95,9 @@ def main() -> None:
         worker_init_fn=seed_worker if evaluation.num_workers else None,
         generator=generator,
         persistent_workers=evaluation.num_workers > 0,
+        **worker_options,
     )
+    print(f"device={device} precision={precision} compile={config.training.compile}")
 
     output = evaluation.output or checkpoint_path.parent / "evaluation.json"
     if spec.protocol == "endpoint_per_entity":
@@ -88,6 +109,7 @@ def main() -> None:
             reset_each_batch=spec.reset_each_batch,
             require_single_item=spec.require_single_item,
             include_predictions=True,
+            precision=precision,
         )
         predictions = result.pop("predictions")
         predictions_output = evaluation.predictions_output or output.with_name(
@@ -108,6 +130,7 @@ def main() -> None:
                 reset_each_batch=spec.reset_each_batch,
                 require_single_item=spec.require_single_item,
                 prediction_sink=writer.write,
+                precision=precision,
             )
         prediction_count = writer.count
 
@@ -117,6 +140,10 @@ def main() -> None:
         "experiment_name": config.experiment.name,
         "dataset_name": bundle.dataset_name,
         "model_name": model_name,
+        "model_architecture": architecture,
+        "continuous_state": continuous_state,
+        "precision": precision,
+        "compile": config.training.compile,
         "subset": bundle.subset,
         "num_predictions": prediction_count,
         "predictions": str(Path(predictions_output).resolve()),

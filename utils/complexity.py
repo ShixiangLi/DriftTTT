@@ -53,12 +53,18 @@ def estimate_model_complexity(
         raise ValueError("Model must contain at least one supported encoder block")
 
     macs += dim  # Final regression head.
+    feature_head = getattr(model, "feature_head", None)
+    if feature_head is not None:
+        macs += sequence_length * dim * input_dim
     parameters = sum(parameter.numel() for parameter in model.parameters())
     trainable_parameters = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
     )
     return {
         "model_type": model_type,
+        "architecture": str(getattr(model, "architecture", "encoder")),
+        "autoregressive": feature_head is not None,
+        "continuous_state": bool(getattr(model, "continuous_state", False)),
         "input_shape": [1, sequence_length, input_dim],
         "parameters": int(parameters),
         "trainable_parameters": int(trainable_parameters),
@@ -79,7 +85,9 @@ def format_model_complexity(complexity: dict[str, Any]) -> str:
         return str(value)
 
     return (
-        f"complexity input={complexity['input_shape']} "
+        f"complexity model={complexity['model_type']}/{complexity['architecture']} "
+        f"continuous_state={complexity['continuous_state']} "
+        f"input={complexity['input_shape']} "
         f"params={compact(complexity['parameters'])} "
         f"forward_macs={compact(complexity['forward_macs'])} "
         f"forward_flops={compact(complexity['forward_flops'])}"

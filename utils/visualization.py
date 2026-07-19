@@ -75,6 +75,8 @@ def plot_training_history(
     val_loss: list[float] = []
     train_rmse: list[float] = []
     val_rmse: list[float] = []
+    train_feature_rmse: list[float] = []
+    val_feature_rmse: list[float] = []
     for index, record in enumerate(records):
         if not isinstance(record, Mapping):
             raise ValueError("Every history record must be an object.")
@@ -87,13 +89,31 @@ def plot_training_history(
         val_loss.append(float(val["loss"]))
         train_rmse.append(float(train["rmse"]))
         val_rmse.append(float(val["rmse"]))
+        if "feature_rmse" in train or "feature_rmse" in val:
+            if "feature_rmse" not in train or "feature_rmse" not in val:
+                raise ValueError(
+                    "Autoregressive history requires train and val feature_rmse."
+                )
+            train_feature_rmse.append(float(train["feature_rmse"]))
+            val_feature_rmse.append(float(val["feature_rmse"]))
 
-    arrays = (train_loss, val_loss, train_rmse, val_rmse)
+    arrays = (
+        train_loss,
+        val_loss,
+        train_rmse,
+        val_rmse,
+        train_feature_rmse,
+        val_feature_rmse,
+    )
     if not all(np.isfinite(values).all() for values in arrays):
         raise ValueError("Training history contains non-finite metrics.")
 
     plt = _pyplot()
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), constrained_layout=True)
+    autoregressive = bool(train_feature_rmse)
+    columns = 3 if autoregressive else 2
+    fig, axes = plt.subplots(
+        1, columns, figsize=(5.5 * columns, 4.2), constrained_layout=True
+    )
     axes[0].plot(
         epochs, train_loss, label="Train", linewidth=2, marker="o", markersize=4
     )
@@ -108,6 +128,28 @@ def plot_training_history(
         epochs, val_rmse, label="Validation", linewidth=2, marker="o", markersize=4
     )
     axes[1].set(title="RMSE", xlabel="Epoch", ylabel="Cycles")
+    if autoregressive:
+        axes[2].plot(
+            epochs,
+            train_feature_rmse,
+            label="Train",
+            linewidth=2,
+            marker="o",
+            markersize=4,
+        )
+        axes[2].plot(
+            epochs,
+            val_feature_rmse,
+            label="Validation",
+            linewidth=2,
+            marker="o",
+            markersize=4,
+        )
+        axes[2].set(
+            title="Next-feature RMSE",
+            xlabel="Epoch",
+            ylabel="Standardized feature value",
+        )
     for axis in axes:
         axis.grid(alpha=0.25)
         axis.legend(frameon=False)

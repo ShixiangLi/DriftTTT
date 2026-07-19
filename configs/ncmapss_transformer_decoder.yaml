@@ -1,12 +1,12 @@
 experiment:
-  name: ncmapss_ds02_ttt
-  output_dir: outputs/ncmapss_ds02_ttt
+  name: ncmapss_ds02_transformer_decoder
+  output_dir: outputs/ncmapss_ds02_transformer_decoder
 
 data:
   name: ncmapss
   data_dir: dataset/n-cmapss
   subset: DS02-006
-  window_size: 512
+  window_size: 1024
   stride: 64
   evaluation_stride: 32
   rul_cap: null
@@ -14,29 +14,29 @@ data:
   variance_threshold: 1.0e-12
   split_seed: 42
   train_rul_filter:
-    enabled: true
+    enabled: false
     normalized_range: [0.3, 1.0]
   options:
     feature_groups: [W, X_s]
     downsample_factor: 1
-    window_boundary: unit
+    window_boundary: flight
     validation_units: null
 
 model:
-  type: ttt
+  type: transformer
+  architecture: decoder
   d_model: 64
   num_layers: 2
   num_heads: 4
   ffn_ratio: 4.0
   dropout: 0.1
-  ttt:
-    qkv_bias: true
-    inner_lr: 1.0
-    inner_scale: 0.3333333333333333
-    cpe_kernel_size: 3
+  autoregressive:
+    enabled: true
+    loss: smooth_l1
+    weight: 0.2
 
 training:
-  batch_size: 64
+  batch_size: 256
   epochs: 50
   patience: 10
   min_delta: 0.0
@@ -45,7 +45,7 @@ training:
   grad_clip: 1.0
   seed: 42
   device: auto
-  num_workers: 4
+  num_workers: 8
   deterministic: false
   precision: auto
   compile: false
@@ -57,8 +57,8 @@ training:
 evaluation:
   checkpoint: null
   device: auto
-  num_workers: 4
-  batch_size: 64
+  num_workers: 8
+  batch_size: 256
   max_test_engines: null
   max_test_batches: null
   output: null

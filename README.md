@@ -3,8 +3,10 @@
 An independent PyTorch project for remaining useful life (RUL) prediction on
 NASA C-MAPSS and N-CMAPSS. It supports both the temporal TTT layer adapted from
 the local `ViTTT/` reference source and a standard self-attention Transformer,
-without importing that project at runtime. Dataset adapters share the model,
-training, checkpoint, metrics, complexity, and visualization pipeline.
+without importing that project at runtime. Both backbones support the original
+encoder-only RUL architecture and a causal decoder with continuous next-feature
+prediction. Dataset adapters share the model, training, checkpoint, metrics,
+complexity, and visualization pipeline.
 
 ## Upstream TTT analysis
 
@@ -33,6 +35,15 @@ operation to `Conv1d(kernel_size=3)`. This is numerically equivalent to the
 only active center row of the source 3x3 kernel, while preserving the source
 scale `9**-0.5 == 1/3`. Padding-aware inner updates are the only material API
 extension. `torch.nn.init.trunc_normal_` replaces the sole `timm` dependency.
+
+Decoder mode makes every temporal operation causal. TTT inner-gradient
+statistics are accumulated from completed chunks, so queries in the current
+chunk are adapted only by earlier chunks. Its temporal branch and positional
+convolution also use only current and earlier values. `chunk_size: 1` gives
+token-wise causal adaptation; larger chunks allow parallel computation inside
+each chunk. With `continuous_state: true`, completed-chunk statistics and the
+short convolution histories continue across calls. Partial chunks also continue
+across window boundaries, so chunk semantics do not depend on evaluation stride.
 
 The detection and segmentation copies were deliberately not used: their old
 `TTTAttention` mutates `self.scale` in `forward`, so first and later calls can
@@ -108,10 +119,9 @@ model features. The 21 standard sensor fields are:
    MAE, and NASA Score are therefore computed over one prediction per engine.
 6. Test loading restores the checkpoint scaler and needs only `test_*.txt` and
    `RUL_*.txt`; it never fits on validation or test data.
-7. Evaluation uses batch size 1, calls `reset_ttt_state()` before every engine,
-   and preserves engine order. The adapted ViTTT algorithm has no persistent
-   fast weights, so reset is intentionally a documented no-op; the boundary
-   call prevents future stateful implementations from leaking across engines.
+7. Continuous TTT execution preserves chronological engine order, consumes only
+   the non-overlapping suffix of each new window, and resets state exactly when
+   `entity_id` changes. A finished engine cannot reappear later in the loader.
 
 NASA Score uses `d=prediction-target`: under-prediction contributes
 `exp(-d/13)-1`, over-prediction contributes `exp(d/10)-1`, summed over evaluated
@@ -181,6 +191,12 @@ hyperparameter flags. Reference configurations are provided for both models:
 .\.venv\Scripts\python.exe -m scripts.train --config configs\cmapss_transformer.yaml
 ```
 
+Decoder-only TTT with autoregressive continuous-feature training:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.train --config configs\cmapss_ttt_decoder.yaml
+```
+
 N-CMAPSS reference runs:
 
 ```powershell
@@ -195,14 +211,26 @@ The YAML sections are:
 | `experiment` | Run name and output directory |
 | `data` | Adapter name, subset, window, RUL cap/filter, validation and sampling |
 | `data.options` | Dataset-specific feature groups, downsampling and boundaries |
-| `model` | Model type, width, depth, heads, FFN ratio, dropout |
-| `model.ttt` | qkv bias, inner learning rate, inner scale, CPE kernel |
-| `training` | Optimizer, epochs, early stop, initialization seed, runtime limits |
+| `model` | Backbone type, encoder/decoder architecture, width, depth, heads |
+| `model.autoregressive` | Next-feature loss type and objective weight |
+| `model.ttt` | qkv bias, inner step, scale, CPE kernel, chunk and state mode |
+| `training` | Optimizer, runtime precision/compilation, early stop, seed and limits |
 | `evaluation` | Checkpoint, device, output files, engine limit, plots |
 
 `data.split_seed` controls only the engine split. `training.seed` controls model
 initialization, batch shuffling, and runtime randomness, so initialization seeds
 can be varied while keeping exactly the same train/validation engines.
+
+`training.precision` accepts `fp32`, `bf16`, or `auto`; `auto` selects BF16 on a
+compatible CUDA GPU and otherwise keeps FP32. Model parameters and TTT inner
+gradient/state statistics remain FP32 under autocast. `training.compile` enables
+in-place `torch.compile` without changing checkpoint keys. It is disabled in the
+portable reference configs because compilation support depends on the PyTorch
+platform; enable it on a supported Linux CUDA server after a short smoke test.
+Pinned-memory loaders use asynchronous CUDA transfers, and worker loaders
+prefetch batches automatically. The N-CMAPSS references use four workers and
+non-deterministic kernels for throughput; set `deterministic: true` when exact
+repeatability is more important than speed.
 
 Both variants share input projection, padding behavior, last-valid-token pooling,
 final normalization, RUL head, data split, optimizer, metrics, checkpoint format,
@@ -210,6 +238,38 @@ and visualizations. The standard variant uses dynamic sinusoidal positions and
 PyTorch pre-norm `TransformerEncoderLayer`; TTT uses CPE plus the ViTTT-derived
 layer. TTT-only settings live under `model.ttt` and are rejected for a standard
 Transformer configuration.
+
+`model.architecture` defaults to `encoder`, preserving existing configurations
+and checkpoints. Set it to `decoder` for causal processing. Decoder mode can
+enable `model.autoregressive`: hidden state `t` predicts standardized feature
+vector `t+1`, while the last valid hidden state predicts endpoint RUL. The
+shared loop optimizes `RUL_MSE + weight * next_feature_loss`; early stopping
+remains based on RUL MSE, while feature loss, RMSE, and MAE are also reported.
+For a fair causal attention baseline, use `model.type: transformer`, keep the
+decoder/autoregressive settings, and omit `model.ttt`.
+
+The TTT decoder configurations enable engine-level state with:
+
+```yaml
+model:
+  architecture: decoder
+  ttt:
+    chunk_size: 32
+    continuous_state: true
+```
+
+In this mode, training shuffling is disabled automatically. Consecutive windows
+from the same engine are collapsed to their unique new-token stream inside each
+batch, RUL predictions are gathered at the original window endpoints, state is
+detached at batch boundaries, and a new engine starts from an empty state. The
+default `continuous_state: false` retains independent-window behavior and old
+checkpoint compatibility.
+
+For official C-MAPSS endpoint testing, the continuous decoder consumes the
+complete observed test trajectory once and reports only its final RUL; this is
+numerically the same causal stream as incremental windows without repeatedly
+feeding their overlap. N-CMAPSS retains its all-window protocol and carries the
+same state across successive windows and flights of one unit.
 
 `data.name` selects `cmapss` or `ncmapss`; older C-MAPSS YAML files without this
 field default to `cmapss`. `data.stride` controls training/validation endpoints,
@@ -244,6 +304,10 @@ metrics use the checkpoint's RUL-cap policy. `evaluation.max_test_engines` is
 intended only for smoke tests because a partial NASA Score is not
 benchmark-comparable. Set `training.plots` or `evaluation.plots` to `false` to
 disable automatic PNG generation.
+
+Autoregressive decoders additionally report teacher-forced next-feature loss,
+RMSE, and MAE on valid transitions. These values use standardized feature space;
+the benchmark RUL metrics and prediction files retain their existing semantics.
 
 Plots can also be regenerated from saved JSON files:
 
@@ -285,6 +349,11 @@ head width `D=C/H`:
 | TTT per-sample fast w1/w2 | `[B,H,D,D]` |
 | TTT per-sample fast w3 | `[B*D,1,3]` |
 | Regression output | `[B]` |
+| Decoder next-feature output | `[B,L,F]` |
+
+During teacher forcing, positions `0..L-2` are compared with input features
+`1..L-1`; transitions touching padding are excluded. Continuous measurements
+are predicted directly rather than quantized into artificial token bins.
 
 ## Project layout
 
@@ -297,6 +366,7 @@ data/
   ncmapss.py            lazy HDF5 schema, preprocessing, splits, and windows
 configs/
   cmapss_ttt.yaml       C-MAPSS TTT experiment
+  cmapss_ttt_decoder.yaml C-MAPSS causal TTT decoder experiment
   cmapss_transformer.yaml C-MAPSS standard Transformer experiment
   ncmapss_ttt.yaml      N-CMAPSS TTT experiment
   ncmapss_transformer.yaml N-CMAPSS standard Transformer experiment

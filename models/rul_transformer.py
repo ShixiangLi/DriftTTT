@@ -36,18 +36,30 @@ def _zero_padding(x: Tensor, padding_mask: Tensor | None) -> Tensor:
 class ConvPositionalEncoding(nn.Module):
     """Depth-wise conditional positional encoding along the time axis."""
 
-    def __init__(self, dim: int, kernel_size: int = 3) -> None:
+    def __init__(
+        self,
+        dim: int,
+        kernel_size: int = 3,
+        causal: bool = False,
+        continuous_state: bool = False,
+    ) -> None:
         super().__init__()
         if kernel_size <= 0 or kernel_size % 2 == 0:
             raise ValueError(
                 f"kernel_size must be a positive odd integer, got {kernel_size}"
             )
         self.dim = dim
+        self.kernel_size = kernel_size
+        self.causal = bool(causal)
+        self.continuous_state = bool(continuous_state)
+        if self.continuous_state and not self.causal:
+            raise ValueError("continuous_state requires causal positional encoding")
+        self._history: Tensor | None = None
         self.conv = nn.Conv1d(
             dim,
             dim,
             kernel_size=kernel_size,
-            padding=kernel_size // 2,
+            padding=0,
             groups=dim,
         )
 
@@ -56,8 +68,43 @@ class ConvPositionalEncoding(nn.Module):
     ) -> Tensor:
         _validate_mask(x, padding_mask)
         x = _zero_padding(x, padding_mask)
-        position_features = self.conv(x.transpose(1, 2)).transpose(1, 2)
+        temporal = x.transpose(1, 2)
+        if self.causal:
+            if self.continuous_state:
+                if x.shape[0] != 1:
+                    raise ValueError(
+                        "continuous positional state requires one stream per call"
+                    )
+                history_size = self.kernel_size - 1
+                if self._history is None:
+                    history = temporal.new_zeros(
+                        1, self.dim, history_size
+                    )
+                else:
+                    history = self._history
+                    if history.device != x.device or history.dtype != x.dtype:
+                        raise RuntimeError(
+                            "positional stream state device/dtype changed; reset "
+                            "the model state first"
+                        )
+                temporal = torch.cat([history, temporal], dim=-1)
+                self._history = (
+                    temporal[:, :, -history_size:].detach()
+                    if history_size
+                    else temporal[:, :, :0].detach()
+                )
+            else:
+                temporal = nn.functional.pad(
+                    temporal, (self.kernel_size - 1, 0)
+                )
+        else:
+            radius = self.kernel_size // 2
+            temporal = nn.functional.pad(temporal, (radius, radius))
+        position_features = self.conv(temporal).transpose(1, 2)
         return _zero_padding(x + position_features, padding_mask)
+
+    def reset_state(self) -> None:
+        self._history = None
 
 
 class FeedForward(nn.Module):
@@ -88,6 +135,9 @@ class TTTTransformerBlock(nn.Module):
         inner_lr: float = 1.0,
         inner_scale: float = 1.0 / 3.0,
         cpe_kernel_size: int = 3,
+        causal: bool = False,
+        chunk_size: int = 16,
+        continuous_state: bool = False,
     ) -> None:
         super().__init__()
         if ffn_ratio <= 0:
@@ -96,7 +146,13 @@ class TTTTransformerBlock(nn.Module):
             raise ValueError(f"dropout must be in [0, 1), got {dropout}")
         hidden_dim = max(1, int(dim * ffn_ratio))
         self.dim = dim
-        self.cpe = ConvPositionalEncoding(dim, cpe_kernel_size)
+        self.causal = bool(causal)
+        self.cpe = ConvPositionalEncoding(
+            dim,
+            cpe_kernel_size,
+            causal=self.causal,
+            continuous_state=continuous_state,
+        )
         self.norm1 = nn.LayerNorm(dim)
         self.ttt = TTTLayer(
             dim=dim,
@@ -104,6 +160,9 @@ class TTTTransformerBlock(nn.Module):
             qkv_bias=qkv_bias,
             inner_lr=inner_lr,
             inner_scale=inner_scale,
+            causal=self.causal,
+            chunk_size=chunk_size,
+            continuous_state=continuous_state,
         )
         self.ttt_dropout = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(dim)
@@ -125,6 +184,7 @@ class TTTTransformerBlock(nn.Module):
         return _zero_padding(x, padding_mask)
 
     def reset_ttt_state(self) -> None:
+        self.cpe.reset_state()
         self.ttt.reset_ttt_state()
 
 
@@ -166,6 +226,7 @@ class StandardTransformerBlock(nn.Module):
         num_heads: int,
         ffn_ratio: float = 4.0,
         dropout: float = 0.1,
+        causal: bool = False,
     ) -> None:
         super().__init__()
         if ffn_ratio <= 0:
@@ -173,6 +234,7 @@ class StandardTransformerBlock(nn.Module):
         if not 0.0 <= dropout < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {dropout}")
         self.dim = dim
+        self.causal = bool(causal)
         self.layer = nn.TransformerEncoderLayer(
             d_model=dim,
             nhead=num_heads,
@@ -192,7 +254,19 @@ class StandardTransformerBlock(nn.Module):
                 f"got {tuple(x.shape)}"
             )
         _validate_mask(x, padding_mask)
-        x = self.layer(x, src_key_padding_mask=padding_mask)
+        causal_mask = None
+        if self.causal:
+            causal_mask = torch.triu(
+                torch.ones(
+                    x.shape[1], x.shape[1], dtype=torch.bool, device=x.device
+                ),
+                diagonal=1,
+            )
+        x = self.layer(
+            x,
+            src_mask=causal_mask,
+            src_key_padding_mask=padding_mask,
+        )
         return _zero_padding(x, padding_mask)
 
 
@@ -216,6 +290,26 @@ def _validate_model_dimensions(
         )
 
 
+def _validate_architecture(
+    architecture: str,
+    autoregressive: bool,
+    autoregressive_loss: str,
+    autoregressive_weight: float,
+) -> str:
+    normalized = str(architecture).strip().lower()
+    if normalized not in {"encoder", "decoder"}:
+        raise ValueError("architecture must be 'encoder' or 'decoder'")
+    if not isinstance(autoregressive, bool):
+        raise TypeError("autoregressive must be bool")
+    if autoregressive and normalized != "decoder":
+        raise ValueError("autoregressive prediction requires decoder architecture")
+    if autoregressive_loss not in {"mse", "smooth_l1"}:
+        raise ValueError("autoregressive_loss must be 'mse' or 'smooth_l1'")
+    if not math.isfinite(autoregressive_weight) or autoregressive_weight <= 0:
+        raise ValueError("autoregressive_weight must be finite and positive")
+    return normalized
+
+
 class _RULTransformerBase(nn.Module):
     """Shared projection, encoding loop, pooling, and regression head."""
 
@@ -226,20 +320,37 @@ class _RULTransformerBase(nn.Module):
         blocks: list[nn.Module],
         config: dict[str, Any],
         position_encoding: nn.Module | None = None,
+        architecture: str = "encoder",
+        autoregressive: bool = False,
+        autoregressive_loss: str = "smooth_l1",
+        autoregressive_weight: float = 0.2,
+        continuous_state: bool = False,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
         self.d_model = d_model
+        self.architecture = architecture
+        self.autoregressive = bool(autoregressive)
+        self.autoregressive_loss = autoregressive_loss
+        self.autoregressive_weight = float(autoregressive_weight)
+        self.continuous_state = bool(continuous_state)
         self.input_projection = nn.Linear(input_dim, d_model)
         self.position_encoding = position_encoding
         self.blocks = nn.ModuleList(blocks)
         self.final_norm = nn.LayerNorm(d_model)
         self.regression_head = nn.Linear(d_model, 1)
+        self.feature_head = (
+            nn.Linear(d_model, input_dim) if self.autoregressive else None
+        )
         self._config = config
 
     def forward(
-        self, x: Tensor, padding_mask: Tensor | None = None
-    ) -> Tensor:
+        self,
+        x: Tensor,
+        padding_mask: Tensor | None = None,
+        *,
+        return_sequence_predictions: bool = False,
+    ) -> Tensor | dict[str, Tensor]:
         if not isinstance(x, Tensor):
             raise TypeError(f"x must be a torch.Tensor, got {type(x).__name__}")
         if x.ndim != 3:
@@ -266,16 +377,91 @@ class _RULTransformerBase(nn.Module):
         hidden = _zero_padding(self.final_norm(hidden), padding_mask)
 
         if padding_mask is None:
-            pooled = hidden[:, -1]
+            last_valid = torch.full(
+                (hidden.shape[0],),
+                hidden.shape[1] - 1,
+                dtype=torch.long,
+                device=hidden.device,
+            )
         else:
             positions = torch.arange(
                 hidden.shape[1], device=hidden.device
             ).expand(hidden.shape[0], -1)
             last_valid = positions.masked_fill(padding_mask, -1).amax(dim=1)
-            pooled = hidden[
-                torch.arange(hidden.shape[0], device=hidden.device), last_valid
-            ]
-        return self.regression_head(pooled).squeeze(-1)
+        batch_positions = torch.arange(hidden.shape[0], device=hidden.device)
+        pooled = hidden[batch_positions, last_valid]
+        sequence_predictions = (
+            self.regression_head(hidden).squeeze(-1)
+            if return_sequence_predictions
+            else None
+        )
+        prediction = (
+            self.regression_head(pooled).squeeze(-1)
+            if sequence_predictions is None
+            else sequence_predictions[batch_positions, last_valid]
+        )
+        if self.feature_head is None and sequence_predictions is None:
+            return prediction
+        output = {
+            "prediction": prediction,
+        }
+        if self.feature_head is not None:
+            output["next_features"] = self.feature_head(hidden)
+        if sequence_predictions is not None:
+            output["sequence_predictions"] = sequence_predictions
+        return output
+
+    @torch.no_grad()
+    def forecast_features(
+        self,
+        x: Tensor,
+        steps: int,
+        padding_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Autoregressively extend normalized feature sequences.
+
+        Stateless models recompute each prefix. Continuous TTT models consume
+        the context once and then feed back one generated token at a time.
+        """
+        if self.feature_head is None:
+            raise RuntimeError("forecast_features requires autoregressive decoder mode")
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
+            raise ValueError("steps must be a positive integer")
+        if padding_mask is not None and padding_mask[:, -1].any():
+            raise ValueError("forecast context cannot end with a padding token")
+
+        if self.continuous_state:
+            if x.shape[0] != 1:
+                raise ValueError(
+                    "continuous-state forecasting supports one engine at a time"
+                )
+            self.reset_ttt_state()
+            output = self(x, padding_mask)
+            assert isinstance(output, dict)
+            generated: list[Tensor] = []
+            for step in range(steps):
+                next_value = output["next_features"][:, -1]
+                generated.append(next_value)
+                if step + 1 < steps:
+                    output = self(next_value.unsqueeze(1))
+                    assert isinstance(output, dict)
+            return torch.stack(generated, dim=1)
+
+        sequence = x
+        mask = padding_mask
+        generated: list[Tensor] = []
+        for _ in range(steps):
+            output = self(sequence, mask)
+            assert isinstance(output, dict)
+            next_value = output["next_features"][:, -1]
+            generated.append(next_value)
+            sequence = torch.cat([sequence, next_value.unsqueeze(1)], dim=1)
+            if mask is not None:
+                valid = torch.zeros(
+                    mask.shape[0], 1, dtype=torch.bool, device=mask.device
+                )
+                mask = torch.cat([mask, valid], dim=1)
+        return torch.stack(generated, dim=1)
 
     def reset_ttt_state(self) -> None:
         """Reset stateful sequence blocks; standard attention has no state."""
@@ -309,10 +495,25 @@ class TTTRULTransformer(_RULTransformerBase):
         inner_lr: float = 1.0,
         inner_scale: float = 1.0 / 3.0,
         cpe_kernel_size: int = 3,
+        architecture: str = "encoder",
+        autoregressive: bool = False,
+        autoregressive_loss: str = "smooth_l1",
+        autoregressive_weight: float = 0.2,
+        chunk_size: int = 16,
+        continuous_state: bool = False,
     ) -> None:
         _validate_model_dimensions(input_dim, d_model, num_layers, num_heads)
+        architecture = _validate_architecture(
+            architecture, autoregressive, autoregressive_loss, autoregressive_weight
+        )
+        causal = architecture == "decoder"
+        if not isinstance(continuous_state, bool):
+            raise TypeError("continuous_state must be bool")
+        if continuous_state and not causal:
+            raise ValueError("continuous_state requires decoder architecture")
         config: dict[str, Any] = {
             "input_dim": input_dim,
+            "architecture": architecture,
             "d_model": d_model,
             "num_layers": num_layers,
             "num_heads": num_heads,
@@ -323,6 +524,16 @@ class TTTRULTransformer(_RULTransformerBase):
             "inner_scale": float(inner_scale),
             "cpe_kernel_size": cpe_kernel_size,
         }
+        if autoregressive:
+            config.update(
+                autoregressive=True,
+                autoregressive_loss=autoregressive_loss,
+                autoregressive_weight=float(autoregressive_weight),
+            )
+        if causal:
+            config["chunk_size"] = chunk_size
+        if continuous_state:
+            config["continuous_state"] = True
         blocks = [
             TTTTransformerBlock(
                 dim=d_model,
@@ -333,10 +544,23 @@ class TTTRULTransformer(_RULTransformerBase):
                 inner_lr=inner_lr,
                 inner_scale=inner_scale,
                 cpe_kernel_size=cpe_kernel_size,
+                causal=causal,
+                chunk_size=chunk_size,
+                continuous_state=continuous_state,
             )
             for _ in range(num_layers)
         ]
-        super().__init__(input_dim, d_model, blocks, config)
+        super().__init__(
+            input_dim,
+            d_model,
+            blocks,
+            config,
+            architecture=architecture,
+            autoregressive=autoregressive,
+            autoregressive_loss=autoregressive_loss,
+            autoregressive_weight=autoregressive_weight,
+            continuous_state=continuous_state,
+        )
 
 
 class StandardRULTransformer(_RULTransformerBase):
@@ -350,22 +574,38 @@ class StandardRULTransformer(_RULTransformerBase):
         num_heads: int = 4,
         ffn_ratio: float = 4.0,
         dropout: float = 0.1,
+        architecture: str = "encoder",
+        autoregressive: bool = False,
+        autoregressive_loss: str = "smooth_l1",
+        autoregressive_weight: float = 0.2,
     ) -> None:
         _validate_model_dimensions(input_dim, d_model, num_layers, num_heads)
+        architecture = _validate_architecture(
+            architecture, autoregressive, autoregressive_loss, autoregressive_weight
+        )
+        causal = architecture == "decoder"
         config: dict[str, Any] = {
             "input_dim": input_dim,
+            "architecture": architecture,
             "d_model": d_model,
             "num_layers": num_layers,
             "num_heads": num_heads,
             "ffn_ratio": float(ffn_ratio),
             "dropout": float(dropout),
         }
+        if autoregressive:
+            config.update(
+                autoregressive=True,
+                autoregressive_loss=autoregressive_loss,
+                autoregressive_weight=float(autoregressive_weight),
+            )
         blocks = [
             StandardTransformerBlock(
                 dim=d_model,
                 num_heads=num_heads,
                 ffn_ratio=ffn_ratio,
                 dropout=dropout,
+                causal=causal,
             )
             for _ in range(num_layers)
         ]
@@ -375,6 +615,10 @@ class StandardRULTransformer(_RULTransformerBase):
             blocks,
             config,
             position_encoding=SinusoidalPositionalEncoding(d_model),
+            architecture=architecture,
+            autoregressive=autoregressive,
+            autoregressive_loss=autoregressive_loss,
+            autoregressive_weight=autoregressive_weight,
         )
 
 

@@ -418,6 +418,20 @@ class NCmapssWindowDataset(Dataset):
     def __len__(self) -> int:
         return self._cumulative[-1]
 
+    def _endpoint(self, span_index: int, local_index: int) -> int:
+        length = self._lengths[span_index]
+        previous = self._cumulative[span_index - 1] if span_index else 0
+        span_count = self._cumulative[span_index] - previous
+        if self.last_only:
+            return length - 1
+        if self.include_partial:
+            if local_index == span_count - 1:
+                return length - 1
+            return min(local_index * self.stride, length - 1)
+        if length < self.window_size:
+            return length - 1
+        return self.window_size - 1 + local_index * self.stride
+
     def _handle(self) -> h5py.File:
         if self._hdf is None:
             self._hdf = _open_hdf5(self.path)
@@ -449,17 +463,12 @@ class NCmapssWindowDataset(Dataset):
         previous = self._cumulative[span_index - 1] if span_index else 0
         local_index = index - previous
         span = self.spans[span_index]
-        length = self._lengths[span_index]
-        if self.last_only:
-            endpoint = length - 1
-        elif self.include_partial:
-            endpoint = min(local_index * self.stride, length - 1)
-            if index == self._cumulative[span_index] - 1:
-                endpoint = length - 1
-        elif length < self.window_size:
-            endpoint = length - 1
-        else:
-            endpoint = self.window_size - 1 + local_index * self.stride
+        endpoint = self._endpoint(span_index, local_index)
+        state_new_tokens = (
+            min(self.window_size, endpoint + 1)
+            if local_index == 0
+            else endpoint - self._endpoint(span_index, local_index - 1)
+        )
 
         logical_start = max(0, endpoint - self.window_size + 1)
         raw_start = span.start + logical_start * self.downsample_factor
@@ -491,6 +500,7 @@ class NCmapssWindowDataset(Dataset):
             "target": torch.tensor(target, dtype=torch.float32),
             "entity_id": torch.tensor(span.entity_id, dtype=torch.long),
             "time_index": torch.tensor(time_index, dtype=torch.long),
+            "state_new_tokens": torch.tensor(state_new_tokens, dtype=torch.long),
             "unit_id": torch.tensor(span.entity_id, dtype=torch.long),
             "cycle": torch.tensor(cycle, dtype=torch.long),
         }

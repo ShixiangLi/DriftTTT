@@ -1,39 +1,42 @@
 experiment:
-  name: ncmapss_ds02_ttt
-  output_dir: outputs/ncmapss_ds02_ttt
+  name: fd002_ttt_decoder_stateful
+  output_dir: outputs/fd002_ttt_decoder_stateful
 
 data:
-  name: ncmapss
-  data_dir: dataset/n-cmapss
-  subset: DS02-006
-  window_size: 512
-  stride: 64
-  evaluation_stride: 32
-  rul_cap: null
+  name: cmapss
+  data_dir: dataset/cmapss
+  subset: FD002
+  window_size: 64
+  stride: 1
+  evaluation_stride: 1
+  rul_cap: 125.0
   val_fraction: 0.2
   variance_threshold: 1.0e-12
   split_seed: 42
   train_rul_filter:
     enabled: true
     normalized_range: [0.3, 1.0]
-  options:
-    feature_groups: [W, X_s]
-    downsample_factor: 1
-    window_boundary: unit
-    validation_units: null
+  options: {}
 
 model:
   type: ttt
+  architecture: decoder
   d_model: 64
   num_layers: 2
   num_heads: 4
   ffn_ratio: 4.0
   dropout: 0.1
+  autoregressive:
+    enabled: true
+    loss: smooth_l1
+    weight: 0.2
   ttt:
     qkv_bias: true
     inner_lr: 1.0
     inner_scale: 0.3333333333333333
     cpe_kernel_size: 3
+    chunk_size: 8
+    continuous_state: true
 
 training:
   batch_size: 64
@@ -45,10 +48,8 @@ training:
   grad_clip: 1.0
   seed: 42
   device: auto
-  num_workers: 4
-  deterministic: false
-  precision: auto
-  compile: false
+  num_workers: 0
+  deterministic: true
   plots: true
   resume: null
   max_train_batches: null
@@ -57,8 +58,8 @@ training:
 evaluation:
   checkpoint: null
   device: auto
-  num_workers: 4
-  batch_size: 64
+  num_workers: 0
+  batch_size: null
   max_test_engines: null
   max_test_batches: null
   output: null

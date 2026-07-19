@@ -16,14 +16,17 @@ from utils.config import ExperimentConfig, load_experiment_config
 from utils.engine import (
     JsonlPredictionWriter,
     build_model,
+    compile_model,
     evaluate_dataset,
     fit,
     load_checkpoint,
     resolve_device,
+    resolve_precision,
     restore_checkpoint,
     save_json,
     seed_worker,
     set_seed,
+    uses_continuous_state,
     verify_data_provenance,
 )
 from utils.visualization import plot_rul_predictions, plot_training_history
@@ -45,6 +48,7 @@ def _make_loader(
     seed: int,
 ) -> DataLoader:
     generator = torch.Generator().manual_seed(seed)
+    worker_options = {"prefetch_factor": 4} if num_workers else {}
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -55,6 +59,7 @@ def _make_loader(
         worker_init_fn=seed_worker if num_workers else None,
         generator=generator,
         persistent_workers=num_workers > 0,
+        **worker_options,
     )
 
 
@@ -78,6 +83,7 @@ def _evaluate_test(
     output_dir: Path,
     max_batches: int | None,
     plots: bool,
+    precision: str,
 ) -> tuple[dict[str, Any], Path, int]:
     spec = bundle.evaluation_spec
     if spec.protocol == "endpoint_per_entity":
@@ -89,6 +95,7 @@ def _evaluate_test(
             reset_each_batch=spec.reset_each_batch,
             require_single_item=spec.require_single_item,
             include_predictions=True,
+            precision=precision,
         )
         predictions = result.pop("predictions")
         path = output_dir / "test_predictions.json"
@@ -105,6 +112,7 @@ def _evaluate_test(
                 reset_each_batch=spec.reset_each_batch,
                 require_single_item=spec.require_single_item,
                 prediction_sink=writer.write,
+                precision=precision,
             )
         count = writer.count
     if plots:
@@ -119,6 +127,7 @@ def main() -> None:
     evaluation = config.evaluation
     adapter = get_dataset_adapter(data_settings.name)
     device = resolve_device(training.device)
+    precision = resolve_precision(training.precision, device)
     resume_payload = (
         load_checkpoint(training.resume, "cpu") if training.resume else None
     )
@@ -154,6 +163,8 @@ def main() -> None:
         model.get_config() if hasattr(model, "get_config") else requested_model_config
     )
     model_complexity = estimate_model_complexity(model, data_settings.window_size)
+    architecture = str(getattr(model, "architecture", "encoder"))
+    continuous_state = uses_continuous_state(model)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=training.learning_rate,
@@ -180,16 +191,23 @@ def main() -> None:
                 "training.epochs must be larger."
             )
 
+    compile_model(model, training.compile)
+
     output_dir = _resolve_output_dir(
         Path(config.experiment.output_dir), training.resume
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     config.save(output_dir / "config.yaml")
     pin_memory = device.type == "cuda"
+    test_dataset = bundle.test_dataset
+    if continuous_state:
+        continuous_view = getattr(test_dataset, "continuous_evaluation_view", None)
+        if callable(continuous_view):
+            test_dataset = continuous_view()
     train_loader = _make_loader(
         bundle.train_dataset,
         batch_size=training.batch_size,
-        shuffle=True,
+        shuffle=not continuous_state,
         num_workers=training.num_workers,
         pin_memory=pin_memory,
         seed=training.seed,
@@ -203,8 +221,15 @@ def main() -> None:
         seed=training.seed,
     )
     test_batch_size = evaluation.batch_size or bundle.evaluation_spec.batch_size
+    if (
+        getattr(test_dataset, "requires_batch_size_one", False)
+        and test_batch_size != 1
+    ):
+        raise ValueError(
+            "continuous C-MAPSS trajectory evaluation requires batch_size=1"
+        )
     test_loader = _make_loader(
-        bundle.test_dataset,
+        test_dataset,
         batch_size=test_batch_size,
         shuffle=False,
         num_workers=evaluation.num_workers,
@@ -216,6 +241,8 @@ def main() -> None:
     checkpoint_metadata = {
         "dataset_name": bundle.dataset_name,
         "model_name": model_name,
+        "model_architecture": architecture,
+        "continuous_state": continuous_state,
         "experiment_name": config.experiment.name,
         "experiment_config": config.to_dict(),
         "model_config": model_config,
@@ -239,6 +266,8 @@ def main() -> None:
             "min_delta": training.min_delta,
             "seed": training.seed,
             "split_seed": data_settings.split_seed,
+            "precision": precision,
+            "compile": training.compile,
         },
     }
     if bundle.dataset_name == "cmapss":
@@ -246,9 +275,12 @@ def main() -> None:
 
     print(
         f"device={device} dataset={bundle.dataset_name} model={model_name} "
+        f"architecture={architecture} "
+        f"continuous_state={continuous_state} "
+        f"precision={precision} compile={training.compile} "
         f"subset={bundle.subset} features={bundle.preprocessor.output_dim} "
         f"train_windows={len(bundle.train_dataset)} "
-        f"val_windows={len(bundle.val_dataset)} test_windows={len(bundle.test_dataset)}"
+        f"val_windows={len(bundle.val_dataset)} test_windows={len(test_dataset)}"
     )
     print(format_model_complexity(model_complexity))
     fit_result = fit(
@@ -269,6 +301,7 @@ def main() -> None:
         best_val_loss=best_val_loss,
         epochs_without_improvement=stale_epochs,
         history=history,
+        precision=precision,
     )
     save_json(
         output_dir / "history.json",
@@ -276,6 +309,10 @@ def main() -> None:
             "experiment_name": config.experiment.name,
             "dataset_name": bundle.dataset_name,
             "model_name": model_name,
+            "model_architecture": architecture,
+            "continuous_state": continuous_state,
+            "precision": precision,
+            "compile": training.compile,
             "best_epoch": fit_result["best_epoch"],
             "best_val_loss": fit_result["best_val_loss"],
             "stopped_early": fit_result["stopped_early"],
@@ -305,12 +342,17 @@ def main() -> None:
         output_dir,
         evaluation_limit,
         training.plots,
+        precision,
     )
     metrics_document = {
         "checkpoint": str(best_path.resolve()),
         "experiment_name": config.experiment.name,
         "dataset_name": bundle.dataset_name,
         "model_name": model_name,
+        "model_architecture": architecture,
+        "continuous_state": continuous_state,
+        "precision": precision,
+        "compile": training.compile,
         "subset": bundle.subset,
         "num_predictions": prediction_count,
         "predictions": str(predictions_path.resolve()),

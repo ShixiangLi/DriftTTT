@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import math
 import os
@@ -13,9 +14,11 @@ from typing import Any
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 MetricFn = Callable[[Sequence[float], Sequence[float]], Mapping[str, float]]
+_PRECISIONS = {"auto", "fp32", "bf16"}
 
 
 def rul_label_policy(rul_cap: float | None) -> dict[str, Any]:
@@ -35,9 +38,8 @@ def set_seed(seed: int, deterministic: bool = True) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     torch.use_deterministic_algorithms(deterministic, warn_only=True)
-    if deterministic:
-        if torch.backends.cudnn.is_available():
-            torch.backends.cudnn.benchmark = False
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.benchmark = not deterministic
 
 
 def seed_worker(worker_id: int) -> None:
@@ -70,6 +72,40 @@ def resolve_device(device: str | torch.device = "auto") -> torch.device:
     return resolved
 
 
+def resolve_precision(precision: str, device: torch.device) -> str:
+    """Resolve runtime precision and reject unsupported BF16 execution."""
+    normalized = str(precision).strip().lower()
+    if normalized not in _PRECISIONS:
+        raise ValueError(f"precision must be one of {sorted(_PRECISIONS)}")
+    if normalized == "auto":
+        if device.type == "cuda" and torch.cuda.is_bf16_supported():
+            return "bf16"
+        return "fp32"
+    if normalized == "bf16":
+        if device.type == "cuda" and not torch.cuda.is_bf16_supported():
+            raise RuntimeError("Configured CUDA device does not support BF16")
+        if device.type not in {"cpu", "cuda"}:
+            raise RuntimeError(f"BF16 autocast is not supported on {device.type}")
+    return normalized
+
+
+def compile_model(model: nn.Module, enabled: bool) -> nn.Module:
+    """Compile a module in place so checkpoint keys and public methods stay stable."""
+    if not enabled:
+        return model
+    compile_method = getattr(model, "compile", None)
+    if not callable(compile_method):
+        raise RuntimeError("training.compile requires torch.nn.Module.compile()")
+    compile_method()
+    return model
+
+
+def _autocast_context(device: torch.device, precision: str):
+    if precision == "fp32":
+        return nullcontext()
+    return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+
+
 def reset_model_state(model: nn.Module) -> None:
     """Reset TTT fast state, including through a DDP-style ``module`` wrapper."""
     target = getattr(model, "module", model)
@@ -79,6 +115,12 @@ def reset_model_state(model: nn.Module) -> None:
         return
 
     return
+
+
+def uses_continuous_state(model: nn.Module) -> bool:
+    """Whether the model expects one chronological entity stream at a time."""
+    target = getattr(model, "module", model)
+    return bool(getattr(target, "continuous_state", False))
 
 
 def build_model(model_name: str, model_config: Mapping[str, Any]) -> nn.Module:
@@ -393,7 +435,13 @@ def _unpack_batch(
         time_index = batch.get("time_index", batch.get("cycle"))
         metadata = {
             key: batch[key]
-            for key in ("engine_id", "unit_id", "cycle", "sample_index")
+            for key in (
+                "engine_id",
+                "unit_id",
+                "cycle",
+                "sample_index",
+                "state_new_tokens",
+            )
             if key in batch
         }
     elif isinstance(batch, Sequence) and len(batch) >= 2:
@@ -406,13 +454,20 @@ def _unpack_batch(
             "A batch must be a mapping or a sequence with at least two values"
         )
 
-    features_tensor = torch.as_tensor(features, dtype=torch.float32, device=device)
-    target_tensor = torch.as_tensor(target, dtype=torch.float32, device=device).reshape(
-        -1
+    non_blocking = device.type == "cuda"
+    features_tensor = torch.as_tensor(features).to(
+        device=device, dtype=torch.float32, non_blocking=non_blocking
+    )
+    target_tensor = (
+        torch.as_tensor(target)
+        .to(device=device, dtype=torch.float32, non_blocking=non_blocking)
+        .reshape(-1)
     )
     mask_tensor = None
     if padding_mask is not None:
-        mask_tensor = torch.as_tensor(padding_mask, dtype=torch.bool, device=device)
+        mask_tensor = torch.as_tensor(padding_mask).to(
+            device=device, dtype=torch.bool, non_blocking=non_blocking
+        )
     entity_tensor = (
         torch.as_tensor(entity_id).reshape(-1) if entity_id is not None else None
     )
@@ -436,18 +491,219 @@ def _forward_model(
     model: nn.Module,
     features: torch.Tensor,
     padding_mask: torch.Tensor | None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, Mapping[str, Any]]:
     if padding_mask is None:
         prediction = model(features)
     else:
         prediction = model(features, padding_mask=padding_mask)
+    output: Mapping[str, Any] = {}
     if isinstance(prediction, Mapping):
-        if "prediction" not in prediction:
+        output = prediction
+        if "prediction" not in output:
             raise KeyError("Model output dictionaries require a 'prediction' value")
-        prediction = prediction["prediction"]
+        prediction = output["prediction"]
     if not isinstance(prediction, torch.Tensor):
         raise TypeError("Model output must be a tensor")
-    return prediction.reshape(-1)
+    return prediction.reshape(-1), output
+
+
+def _autoregressive_terms(
+    model: nn.Module,
+    output: Mapping[str, Any],
+    features: torch.Tensor,
+    padding_mask: torch.Tensor | None,
+) -> dict[str, Any] | None:
+    predicted = output.get("next_features")
+    if predicted is None:
+        return None
+    if not isinstance(predicted, torch.Tensor):
+        raise TypeError("next_features must be a tensor")
+    if predicted.shape != features.shape:
+        raise ValueError(
+            "next_features must match input shape [batch, length, features]; "
+            f"got {tuple(predicted.shape)} and {tuple(features.shape)}"
+        )
+    if features.shape[1] < 2:
+        return None
+
+    transition_mask = torch.ones(
+        features.shape[:2], dtype=torch.bool, device=features.device
+    )
+    transition_mask = transition_mask[:, 1:]
+    if padding_mask is not None:
+        transition_mask = (~padding_mask[:, :-1]) & (~padding_mask[:, 1:])
+    element_mask = transition_mask.unsqueeze(-1).expand(
+        -1, -1, features.shape[-1]
+    )
+    count = int(element_mask.sum().item())
+    if count == 0:
+        return None
+
+    error = predicted[:, :-1] - features[:, 1:]
+    mask_values = element_mask.to(dtype=error.dtype)
+    target_model = getattr(model, "module", model)
+    loss_name = str(getattr(target_model, "autoregressive_loss", "smooth_l1"))
+    weight = float(getattr(target_model, "autoregressive_weight", 0.0))
+    if weight <= 0:
+        raise ValueError("Autoregressive model weight must be positive")
+    if loss_name == "mse":
+        element_loss = error.square()
+    elif loss_name == "smooth_l1":
+        element_loss = F.smooth_l1_loss(
+            predicted[:, :-1], features[:, 1:], reduction="none"
+        )
+    else:
+        raise ValueError(f"Unsupported autoregressive loss: {loss_name!r}")
+    loss_sum = (element_loss * mask_values).sum()
+    return {
+        "loss": loss_sum / count,
+        "loss_sum": loss_sum.detach(),
+        "squared_error": (error.square() * mask_values).sum().detach(),
+        "absolute_error": (error.abs() * mask_values).sum().detach(),
+        "count": count,
+        "weight": weight,
+        "name": loss_name,
+    }
+
+
+class _EntityStreamTracker:
+    """Validate entity-contiguous chronological batches and reset boundaries."""
+
+    def __init__(self) -> None:
+        self.active_entity: int | None = None
+        self.last_time: int | None = None
+        self.completed_entities: set[int] = set()
+
+    def advance(self, model: nn.Module, entity_id: int, time_index: int) -> None:
+        if entity_id != self.active_entity:
+            if entity_id in self.completed_entities:
+                raise ValueError(
+                    "continuous TTT state requires entity-contiguous sampling; "
+                    f"entity {entity_id} appeared again after its stream ended"
+                )
+            if self.active_entity is not None:
+                self.completed_entities.add(self.active_entity)
+            reset_model_state(model)
+            self.active_entity = entity_id
+            self.last_time = None
+        if self.last_time is not None and time_index <= self.last_time:
+            raise ValueError(
+                "continuous TTT state requires strictly increasing time_index "
+                f"within entity {entity_id}; got {time_index} after {self.last_time}"
+            )
+        self.last_time = time_index
+
+
+def _combine_autoregressive_terms(
+    terms: Sequence[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    if not terms:
+        return None
+    count = sum(int(term["count"]) for term in terms)
+    first = terms[0]
+    weight = float(first["weight"])
+    name = str(first["name"])
+    if any(
+        float(term["weight"]) != weight or str(term["name"]) != name
+        for term in terms[1:]
+    ):
+        raise RuntimeError("autoregressive settings changed within one batch")
+    loss_numerator = sum(
+        term["loss"] * int(term["count"]) for term in terms
+    )
+    return {
+        "loss": loss_numerator / count,
+        "loss_sum": sum(term["loss_sum"] for term in terms),
+        "squared_error": sum(term["squared_error"] for term in terms),
+        "absolute_error": sum(term["absolute_error"] for term in terms),
+        "count": count,
+        "weight": weight,
+        "name": name,
+    }
+
+
+def _forward_continuous_batch(
+    model: nn.Module,
+    features: torch.Tensor,
+    padding_mask: torch.Tensor | None,
+    entity_ids: torch.Tensor | None,
+    time_indices: torch.Tensor | None,
+    batch_metadata: Mapping[str, torch.Tensor],
+    tracker: _EntityStreamTracker,
+) -> tuple[torch.Tensor, dict[str, Any] | None]:
+    if entity_ids is None or time_indices is None:
+        raise ValueError(
+            "continuous TTT state requires entity_id and time_index metadata"
+        )
+    new_token_values = batch_metadata.get("state_new_tokens")
+    if new_token_values is None:
+        raise ValueError(
+            "continuous TTT state requires state_new_tokens from the dataset"
+        )
+    batch_size = features.shape[0]
+    if any(
+        values.numel() != batch_size
+        for values in (entity_ids, time_indices, new_token_values)
+    ):
+        raise ValueError("continuous-state metadata must have one value per sample")
+
+    predictions: list[torch.Tensor] = []
+    feature_terms: list[Mapping[str, Any]] = []
+    index = 0
+    while index < batch_size:
+        entity_id = int(entity_ids[index])
+        stream_segments: list[torch.Tensor] = []
+        endpoint_positions: list[int] = []
+        stream_length = 0
+        while index < batch_size and int(entity_ids[index]) == entity_id:
+            tracker.advance(model, entity_id, int(time_indices[index]))
+            sample = features[index]
+            valid = (
+                sample
+                if padding_mask is None
+                else sample[~padding_mask[index]]
+            )
+            new_tokens = int(new_token_values[index])
+            if new_tokens <= 0 or new_tokens > valid.shape[0]:
+                raise ValueError(
+                    "state_new_tokens must select a non-empty suffix of the "
+                    f"valid window; got {new_tokens} for {valid.shape[0]} "
+                    "valid tokens"
+                )
+            segment = valid[-new_tokens:]
+            stream_segments.append(segment)
+            stream_length += new_tokens
+            endpoint_positions.append(stream_length - 1)
+            index += 1
+
+        incremental = torch.cat(stream_segments, dim=0).unsqueeze(0)
+        raw_output = model(
+            incremental,
+            return_sequence_predictions=True,
+        )
+        if not isinstance(raw_output, Mapping):
+            raise TypeError(
+                "continuous TTT model must return sequence prediction metadata"
+            )
+        sequence_predictions = raw_output.get("sequence_predictions")
+        if not isinstance(sequence_predictions, torch.Tensor):
+            raise KeyError(
+                "continuous TTT model output requires sequence_predictions"
+            )
+        if sequence_predictions.shape != incremental.shape[:2]:
+            raise ValueError(
+                "sequence_predictions must have shape [1, stream_length]"
+            )
+        positions = torch.tensor(
+            endpoint_positions,
+            dtype=torch.long,
+            device=sequence_predictions.device,
+        )
+        predictions.extend(sequence_predictions[0].index_select(0, positions))
+        terms = _autoregressive_terms(model, raw_output, incremental, None)
+        if terms is not None:
+            feature_terms.append(terms)
+    return torch.stack(predictions), _combine_autoregressive_terms(feature_terms)
 
 
 def _fallback_metrics(
@@ -493,18 +749,28 @@ def _run_loader(
     require_single_item: bool,
     include_predictions: bool,
     prediction_sink: Callable[[Sequence[Mapping[str, Any]]], None] | None = None,
+    precision: str = "fp32",
 ) -> dict[str, Any]:
     if max_batches is not None and max_batches <= 0:
         raise ValueError("max_batches must be positive when provided")
     training = optimizer is not None
+    resolved_precision = resolve_precision(precision, device)
     model.train(training)
-    if not reset_each_batch:
+    continuous_state = uses_continuous_state(model)
+    stream_tracker = _EntityStreamTracker() if continuous_state else None
+    if continuous_state or not reset_each_batch:
         reset_model_state(model)
 
     total_loss = 0.0
     sample_count = 0
     gradient_norm_sum = 0.0
     gradient_steps = 0
+    feature_loss_sum = 0.0
+    feature_squared_error = 0.0
+    feature_absolute_error = 0.0
+    feature_count = 0
+    autoregressive_weight: float | None = None
+    autoregressive_loss_name: str | None = None
     y_true: list[float] = []
     y_pred: list[float] = []
     accumulator: Any = None
@@ -519,7 +785,7 @@ def _run_loader(
         for batch_index, batch in enumerate(loader):
             if max_batches is not None and batch_index >= max_batches:
                 break
-            if reset_each_batch:
+            if reset_each_batch and not continuous_state:
                 reset_model_state(model)
             (
                 features,
@@ -536,14 +802,45 @@ def _run_loader(
 
             if training:
                 optimizer.zero_grad(set_to_none=True)
-            prediction = _forward_model(model, features, padding_mask)
-            if prediction.numel() != target.numel():
-                raise ValueError(
-                    f"Model returned {prediction.numel()} values for {target.numel()} targets"
-                )
-            loss = criterion(prediction, target)
+            with _autocast_context(device, resolved_precision):
+                if stream_tracker is None:
+                    prediction, model_output = _forward_model(
+                        model, features, padding_mask
+                    )
+                    feature_terms = _autoregressive_terms(
+                        model, model_output, features, padding_mask
+                    )
+                else:
+                    prediction, feature_terms = _forward_continuous_batch(
+                        model,
+                        features,
+                        padding_mask,
+                        entity_ids,
+                        time_indices,
+                        batch_metadata,
+                        stream_tracker,
+                    )
+                if prediction.numel() != target.numel():
+                    raise ValueError(
+                        "Model returned "
+                        f"{prediction.numel()} values for {target.numel()} targets"
+                    )
+                loss = criterion(prediction, target)
+                objective = loss
+                if feature_terms is not None:
+                    objective = (
+                        objective
+                        + feature_terms["weight"] * feature_terms["loss"]
+                    )
+            if feature_terms is not None:
+                feature_loss_sum += float(feature_terms["loss_sum"])
+                feature_squared_error += float(feature_terms["squared_error"])
+                feature_absolute_error += float(feature_terms["absolute_error"])
+                feature_count += int(feature_terms["count"])
+                autoregressive_weight = float(feature_terms["weight"])
+                autoregressive_loss_name = str(feature_terms["name"])
             if training:
-                loss.backward()
+                objective.backward()
                 if grad_clip is not None and grad_clip > 0.0:
                     norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                     gradient_norm_sum += float(norm.detach())
@@ -573,7 +870,9 @@ def _run_loader(
                     else [None] * batch_size
                 )
                 metadata_values = {
-                    key: value.tolist() for key, value in batch_metadata.items()
+                    key: value.tolist()
+                    for key, value in batch_metadata.items()
+                    if key != "state_new_tokens"
                 }
                 batch_records: list[dict[str, Any]] = []
                 for index in range(batch_size):
@@ -611,6 +910,18 @@ def _run_loader(
         result.update(_compute_metrics(y_true, y_pred, metric_fn))
     if gradient_steps:
         result["gradient_norm"] = gradient_norm_sum / gradient_steps
+    if feature_count:
+        feature_loss = feature_loss_sum / feature_count
+        assert autoregressive_weight is not None
+        result.update(
+            objective_loss=result["loss"] + autoregressive_weight * feature_loss,
+            feature_loss=feature_loss,
+            feature_rmse=math.sqrt(feature_squared_error / feature_count),
+            feature_mae=feature_absolute_error / feature_count,
+            feature_elements=feature_count,
+            autoregressive_weight=autoregressive_weight,
+            autoregressive_loss=autoregressive_loss_name,
+        )
     if include_predictions:
         result["predictions"] = records
     return result
@@ -626,6 +937,7 @@ def train_one_epoch(
     grad_clip: float | None = 1.0,
     max_batches: int | None = None,
     metric_fn: MetricFn | None = None,
+    precision: str = "fp32",
 ) -> dict[str, float]:
     """Train for one epoch with MSE loss and optional global gradient clipping."""
     resolved_device = resolve_device(device)
@@ -642,6 +954,7 @@ def train_one_epoch(
         reset_each_batch=False,
         require_single_item=False,
         include_predictions=False,
+        precision=precision,
     )
 
 
@@ -657,6 +970,7 @@ def evaluate_loader(
     prediction_sink: Callable[[Sequence[Mapping[str, Any]]], None] | None = None,
     reset_each_batch: bool = False,
     require_single_item: bool = False,
+    precision: str = "fp32",
 ) -> dict[str, Any]:
     """Evaluate an ordinary validation loader without mutating model parameters."""
     resolved_device = resolve_device(device)
@@ -674,6 +988,7 @@ def evaluate_loader(
         require_single_item=require_single_item,
         include_predictions=include_predictions,
         prediction_sink=prediction_sink,
+        precision=precision,
     )
 
 
@@ -686,6 +1001,7 @@ def evaluate_by_engine(
     max_engines: int | None = None,
     metric_fn: MetricFn | None = None,
     include_predictions: bool = True,
+    precision: str = "fp32",
 ) -> dict[str, Any]:
     """Evaluate one engine per batch, resetting TTT state before every engine."""
     resolved_device = resolve_device(device)
@@ -702,6 +1018,7 @@ def evaluate_by_engine(
         reset_each_batch=True,
         require_single_item=True,
         include_predictions=include_predictions,
+        precision=precision,
     )
 
 
@@ -715,6 +1032,7 @@ def evaluate_dataset(
     require_single_item: bool = False,
     include_predictions: bool = False,
     prediction_sink: Callable[[Sequence[Mapping[str, Any]]], None] | None = None,
+    precision: str = "fp32",
 ) -> dict[str, Any]:
     """Evaluate a dataset according to its adapter-provided lifecycle policy."""
     return evaluate_loader(
@@ -726,6 +1044,7 @@ def evaluate_dataset(
         prediction_sink=prediction_sink,
         reset_each_batch=reset_each_batch,
         require_single_item=require_single_item,
+        precision=precision,
     )
 
 
@@ -750,6 +1069,7 @@ def fit(
     history: Sequence[Mapping[str, Any]] = (),
     metric_fn: MetricFn | None = None,
     verbose: bool = True,
+    precision: str = "fp32",
 ) -> dict[str, Any]:
     """Fit with validation early stopping and atomic best/last checkpoints."""
     if epochs <= 0:
@@ -785,6 +1105,7 @@ def fit(
             grad_clip=grad_clip,
             max_batches=max_train_batches,
             metric_fn=metric_fn,
+            precision=precision,
         )
         val_metrics = evaluate_loader(
             model,
@@ -792,6 +1113,7 @@ def fit(
             resolved_device,
             max_batches=max_val_batches,
             metric_fn=metric_fn,
+            precision=precision,
         )
         epoch_record = {
             "epoch": epoch,
@@ -831,11 +1153,18 @@ def fit(
         )
 
         if verbose:
+            auxiliary = ""
+            if "feature_rmse" in train_metrics:
+                auxiliary = (
+                    f" train_objective={train_metrics['objective_loss']:.6f} "
+                    f"val_feature_rmse={val_metrics['feature_rmse']:.6f}"
+                )
             print(
                 f"epoch={epoch + 1}/{epochs} "
                 f"train_mse={train_metrics['loss']:.6f} "
                 f"val_mse={val_metrics['loss']:.6f} "
                 f"val_rmse={val_metrics.get('rmse', math.nan):.6f}"
+                f"{auxiliary}"
             )
         if patience > 0 and epochs_without_improvement >= patience:
             stopped_early = True

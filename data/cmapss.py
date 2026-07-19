@@ -589,6 +589,11 @@ class WindowedCmapssDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         sequence_index, endpoint = self._sample_index[index]
         sequence = self._sequences[sequence_index]
+        if index > 0 and self._sample_index[index - 1][0] == sequence_index:
+            previous_endpoint = self._sample_index[index - 1][1]
+            state_new_tokens = endpoint - previous_endpoint
+        else:
+            state_new_tokens = min(self.window_size, endpoint + 1)
         start = max(0, endpoint - self.window_size + 1)
         valid = sequence.features[start : endpoint + 1]
         pad_length = self.window_size - valid.shape[0]
@@ -607,6 +612,7 @@ class WindowedCmapssDataset(Dataset):
             "target": torch.tensor(sequence.targets[endpoint], dtype=torch.float32),
             "entity_id": torch.tensor(sequence.engine_id, dtype=torch.long),
             "time_index": torch.tensor(sequence.cycles[endpoint], dtype=torch.long),
+            "state_new_tokens": torch.tensor(state_new_tokens, dtype=torch.long),
             "engine_id": torch.tensor(sequence.engine_id, dtype=torch.long),
             "cycle": torch.tensor(sequence.cycles[endpoint], dtype=torch.long),
         }
@@ -616,12 +622,69 @@ class WindowedCmapssDataset(Dataset):
 
         return self._engine_to_indices.get(int(engine_id), ())
 
+    def continuous_evaluation_view(self) -> "EngineTrajectoryCmapssDataset":
+        """Expose each complete observed trajectory for stateful endpoint RUL."""
+        return EngineTrajectoryCmapssDataset(
+            self._sequences,
+            feature_names=self.feature_names,
+            feature_dim=self.feature_dim,
+        )
+
     @property
     def sample_engine_ids(self) -> tuple[int, ...]:
         return tuple(
             self._sequences[sequence_index].engine_id
             for sequence_index, _ in self._sample_index
         )
+
+
+class EngineTrajectoryCmapssDataset(Dataset):
+    """One complete observed sequence per engine for continuous-state testing."""
+
+    requires_batch_size_one = True
+
+    def __init__(
+        self,
+        sequences: Sequence[_EngineSequence],
+        *,
+        feature_names: Sequence[str],
+        feature_dim: int,
+    ) -> None:
+        if not sequences:
+            raise ValueError("continuous C-MAPSS evaluation requires trajectories")
+        self._sequences = tuple(sequences)
+        self.feature_names = tuple(feature_names)
+        self.feature_dim = int(feature_dim)
+        self.engine_ids = tuple(sequence.engine_id for sequence in self._sequences)
+
+    def __len__(self) -> int:
+        return len(self._sequences)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        sequence = self._sequences[index]
+        length = sequence.features.shape[0]
+        return {
+            "features": torch.from_numpy(
+                np.ascontiguousarray(sequence.features)
+            ),
+            "padding_mask": torch.zeros(length, dtype=torch.bool),
+            "target": torch.tensor(sequence.targets[-1], dtype=torch.float32),
+            "entity_id": torch.tensor(sequence.engine_id, dtype=torch.long),
+            "time_index": torch.tensor(sequence.cycles[-1], dtype=torch.long),
+            "state_new_tokens": torch.tensor(length, dtype=torch.long),
+            "engine_id": torch.tensor(sequence.engine_id, dtype=torch.long),
+            "cycle": torch.tensor(sequence.cycles[-1], dtype=torch.long),
+        }
+
+    def indices_for_engine(self, engine_id: int) -> tuple[int, ...]:
+        try:
+            return (self.engine_ids.index(int(engine_id)),)
+        except ValueError:
+            return ()
+
+    @property
+    def sample_engine_ids(self) -> tuple[int, ...]:
+        return self.engine_ids
 
 
 # A shorter alias is convenient in training code while retaining the explicit
@@ -931,6 +994,7 @@ __all__ = [
     "VALID_SUBSETS",
     "CmapssRawData",
     "CmapssPreprocessor",
+    "EngineTrajectoryCmapssDataset",
     "WindowedCmapssDataset",
     "CmapssWindowDataset",
     "CmapssDataBundle",
