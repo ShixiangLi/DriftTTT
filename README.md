@@ -1,388 +1,315 @@
 # DriftTTT
 
-An independent PyTorch project for remaining useful life (RUL) prediction on
-NASA C-MAPSS and N-CMAPSS. It supports both the temporal TTT layer adapted from
-the local `ViTTT/` reference source and a standard self-attention Transformer,
-without importing that project at runtime. Both backbones support the original
-encoder-only RUL architecture and a causal decoder with continuous next-feature
-prediction. Dataset adapters share the model, training, checkpoint, metrics,
-complexity, and visualization pipeline.
+DriftTTT is a PyTorch project for remaining-useful-life (RUL) prediction on
+NASA C-MAPSS and N-CMAPSS. It uses one Transformer encoder backbone with a
+configuration-selected sequence mixer. The current mixers are standard
+self-attention, a test-time-training MLP (`ttt_mlp`), and a fixed-rank
+multiscale TTT mixture of experts (`ttt_multiscale_moe`).
 
-## Upstream TTT analysis
+## Current model
 
-The reusable implementation is `ViTTT/ttt_block.py`; its copies under
-`ViTTT/vittt/models/` and `ViTTT/dittt/` are byte-identical. Its interface is
-`TTT(dim, num_heads).forward(x, h, w)`, with input and output shape `[B,N,C]`,
-`N=h*w`, and head dimension `D=C/num_heads`.
+The model maps input windows from `[B,L,F]` to `[B,L,d_model]`, adds dynamic
+sinusoidal positions, and applies shared Transformer blocks. Every block has
+the same normalization, residual, feed-forward, and masking path; only its
+sequence mixer changes. The last valid timestep is normalized and passed to a
+scalar RUL regression head.
 
-The joint projection emits `3C+3D` values and feeds two inner models:
-
-- simplified SwiGLU branch: q/k/v are `[B,H,N,D]`, with base weights w1/w2
-  shaped `[1,H,D,D]`;
-- depthwise-convolution branch: q/k/v are `[B,D,h,w]`, with base weights w3
-  shaped `[D,1,3,3]`.
-
-Each forward call derives one set of fast weights per sample from k/v using
-the source's closed-form gradients, `g/(norm+1)` stabilization, and one inner
-step. Fast weights are local tensors: they are not written back to parameters
-and are not shared by batch items or later calls. The outer RUL loss still
-backpropagates through the update formula into qkv, w1/w2/w3, and projection
-parameters. ViTTT uses the layer as a pre-norm attention replacement:
-`x = x + TTT(LayerNorm(x))`, followed by an FFN residual.
-
-For time series, `models/ttt_layer.py` maps the effective `h=1,w=L`
-operation to `Conv1d(kernel_size=3)`. This is numerically equivalent to the
-only active center row of the source 3x3 kernel, while preserving the source
-scale `9**-0.5 == 1/3`. Padding-aware inner updates are the only material API
-extension. `torch.nn.init.trunc_normal_` replaces the sole `timm` dependency.
-
-Decoder mode makes every temporal operation causal. TTT inner-gradient
-statistics are accumulated from completed chunks, so queries in the current
-chunk are adapted only by earlier chunks. Its temporal branch and positional
-convolution also use only current and earlier values. `chunk_size: 1` gives
-token-wise causal adaptation; larger chunks allow parallel computation inside
-each chunk. With `continuous_state: true`, completed-chunk statistics and the
-short convolution histories continue across calls. Partial chunks also continue
-across window boundaries, so chunk semantics do not depend on evaluation stride.
-
-The detection and segmentation copies were deliberately not used: their old
-`TTTAttention` mutates `self.scale` in `forward`, so first and later calls can
-behave differently.
-
-## C-MAPSS inventory
-
-`dataset/cmapss/` contains 12 ASCII, LF-terminated, headerless files. Trajectory
-rows have exactly 26 whitespace-delimited values and trailing spaces; use
-`sep=r"\s+"`, not a literal single-space separator. RUL files contain one
-integer per test engine in ascending engine-ID order.
-
-| Subset | Conditions | Fault modes | Train rows/engines | Test rows/engines |
-| --- | ---: | ---: | ---: | ---: |
-| FD001 | 1 | 1 | 20,631 / 100 | 13,096 / 100 |
-| FD002 | 6 | 1 | 53,759 / 260 | 33,991 / 259 |
-| FD003 | 1 | 2 | 24,720 / 100 | 16,596 / 100 |
-| FD004 | 6 | 2 | 61,249 / 249 | 41,214 / 248 |
-
-The single fault mode is HPC degradation; the two-mode subsets additionally
-contain fan degradation. Each trajectory row is:
-
-```text
-engine_id cycle setting_1 setting_2 setting_3 sensor_1 ... sensor_21
-```
-
-`engine_id` and `cycle` are used for grouping, ordering, and labels, not as
-model features. The 21 standard sensor fields are:
-
-| Field | Operational variable |
-| --- | --- |
-| setting_1 | Altitude |
-| setting_2 | Mach number |
-| setting_3 | Throttle resolver angle (TRA) |
-
-| Field | Standard name | Measurement |
-| --- | --- | --- |
-| sensor_1 | T2 | Fan inlet total temperature |
-| sensor_2 | T24 | LPC outlet total temperature |
-| sensor_3 | T30 | HPC outlet total temperature |
-| sensor_4 | T50 | LPT outlet total temperature |
-| sensor_5 | P2 | Fan inlet pressure |
-| sensor_6 | P15 | Bypass-duct total pressure |
-| sensor_7 | P30 | HPC outlet total pressure |
-| sensor_8 | Nf | Physical fan speed |
-| sensor_9 | Nc | Physical core speed |
-| sensor_10 | epr | Engine pressure ratio, P50/P2 |
-| sensor_11 | Ps30 | HPC outlet static pressure |
-| sensor_12 | phi | Fuel-flow/Ps30 ratio |
-| sensor_13 | NRf | Corrected fan speed |
-| sensor_14 | NRc | Corrected core speed |
-| sensor_15 | BPR | Bypass ratio |
-| sensor_16 | farB | Burner fuel-air ratio |
-| sensor_17 | htBleed | Bleed enthalpy |
-| sensor_18 | Nf_dmd | Demanded fan speed |
-| sensor_19 | PCNfR_dmd | Demanded corrected fan speed |
-| sensor_20 | W31 | HPT coolant bleed |
-| sensor_21 | W32 | LPT coolant bleed |
-
-## Leakage controls
-
-1. Official training engines are split by whole `engine_id` before windows are
-   built. No engine can occur in both training and validation.
-2. Variance filtering and `StandardScaler` are fitted only on rows from the
-   training-engine split. Their complete state and fitting IDs are checkpointed.
-3. Windows are indexed inside one engine trajectory and can never cross an
-   engine boundary. Short test trajectories receive zero left padding plus a
-   boolean mask.
-4. Train/validation RUL at cycle `t` is `max_cycle(engine)-t`. The default
-   piecewise target applies `min(RUL,125)` consistently to train, validation,
-   and official test endpoint labels. Use `--rul-cap 0` for raw linear RUL.
-5. Official testing uses exactly the last window of each test engine. RMSE,
-   MAE, and NASA Score are therefore computed over one prediction per engine.
-6. Test loading restores the checkpoint scaler and needs only `test_*.txt` and
-   `RUL_*.txt`; it never fits on validation or test data.
-7. Continuous TTT execution preserves chronological engine order, consumes only
-   the non-overlapping suffix of each new window, and resets state exactly when
-   `entity_id` changes. A finished engine cannot reappear later in the loader.
-
-NASA Score uses `d=prediction-target`: under-prediction contributes
-`exp(-d/13)-1`, over-prediction contributes `exp(d/10)-1`, summed over evaluated
-predictions.
-
-## N-CMAPSS
-
-N-CMAPSS adapters read one `N-CMAPSS_DS*.h5` file lazily. The default observed
-features are the four scenario descriptors in `W` plus the 14 measurements in
-`X_s`. `X_v` can be enabled explicitly. The unobservable health parameters in
-`T` are rejected as model features to prevent degradation-state leakage.
-
-The official `dev` units are split into disjoint train/validation units and the
-official `test` units are never used for preprocessing. Feature variances and
-normalization statistics are fitted sequentially from training-unit HDF5
-chunks. Window indices contain only compact unit spans and cumulative counts;
-individual feature windows are loaded on demand. HDF5 files are schema-checked
-before training, including aligned row counts and required variable names.
-
-Unlike classic C-MAPSS endpoint testing, N-CMAPSS supplies full test
-run-to-failure trajectories and one RUL label per 1 Hz sample. Its default
-evaluation protocol therefore scores all test windows and streams predictions
-to JSON Lines instead of retaining millions of records in memory.
-
-Training-only degradation-stage filtering is label based, never row-count
-based. For each training entity, `effective_rul / max_effective_rul` is used:
+Select the mixer in either dataset configuration:
 
 ```yaml
-data:
-  train_rul_filter:
-    enabled: true
-    normalized_range: [0.0, 0.7]
+model:
+  sequence_mixer: ttt_multiscale_moe
 ```
 
-This retains the RUL interval closest to failure through 70% of the entity's
-effective label range. With a C-MAPSS cap of 125, it retains RUL 0 through 87.5
-and excludes the capped 125 plateau. Validation and test trajectories always
-remain complete. Set `[0.3, 1.0]` for the earlier-life label range or disable
-the filter to preserve the original behavior.
+`attention` uses standard multi-head self-attention. `ttt_mlp` projects
+queries, keys, and values per head and treats a two-layer MLP as sample-local
+fast state. Its label-free inner objective always reconstructs `value - key`
+from the same-time key. For each configured chunk, it takes one differentiable
+inner gradient step and applies the updated MLP to queries. Fast weights start
+from learned outer parameters, remain separate for every sample, and are
+discarded after each forward call. They are never written back or shared
+across batches. TTT inner updates stay in FP32 under mixed precision.
+
+`ttt_multiscale_moe` partitions the same fast-MLP hidden rank between a short
+expert and a long expert instead of constructing two complete networks. The
+short expert receives the base-token high-frequency residual and adapts at the
+observation clock. Independent integer cycle metadata groups observations into
+physical cycle states for the long expert; it is never taken from the
+normalized cycle feature. Cycle means can be smoothed using the actual cycle
+gap, and each long result is mapped back to its source observations. A
+lightweight per-head gate fuses both outputs. QKV, output projections, and the
+total fast-MLP rank remain shared and fixed. Both experts use the same stable
+reconstruction objective at their respective clocks. The final gated long
+contribution can be centered over valid observations, so it expresses relative
+degradation shape without replacing the absolute-health query path. A sample
+with fewer than two observed cycles automatically bypasses the long correction.
+Short- and long-expert fast states are sample-local and discarded after every
+window.
+
+All TTT-MLP settings live in the same YAML:
+
+```yaml
+model:
+  ttt:
+    hidden_multiplier: 2.0
+    inner_learning_rate: 0.1
+    chunk_size: 16
+    inner_gradient_clip: 1.0
+    activation: silu
+    qkv_bias: true
+    multiscale:
+      short_rank_ratio: 0.5
+      long_ema_decay: 0.9
+      long_update_interval: 3
+      long_inner_learning_rate: 0.025
+      center_long_residual: true
+```
+
+The common `inner_learning_rate` and `chunk_size` configure short-expert
+updates. `long_update_interval` is the number of cycle states in one long
+update. `long_ema_decay` is applied per lifecycle-cycle gap rather than per raw
+observation; zero uses observed cycle means directly. N-CMAPSS uses zero
+because cycle aggregation is already a strong low-pass operation, while
+C-MAPSS retains cross-cycle EMA smoothing. `center_long_residual=false`
+provides the absolute-offset ablation. These multiscale values are ignored by
+`attention` and `ttt_mlp`.
+
+All TTT mixers use only the label-free same-coordinate reconstruction task
+during their inner update. RUL labels are used exclusively by the outer
+regression loss. Evaluation reports RMSE, MAE, MSE, and the asymmetric NASA
+score. Checkpoints contain model and optimizer states, the normalized
+configuration, feature schema, fitted preprocessing statistics, and entity
+split IDs.
+
+## Data processing
+
+### C-MAPSS
+
+Place the official files under `dataset/cmapss/`. All four subsets are
+supported: FD001, FD002, FD003, and FD004.
+
+- Official training engines are split into disjoint train/validation engines.
+- Variance selection and standardization are fitted only on training engines.
+- Windows never cross engine boundaries.
+- Training and validation labels are `max_cycle - current_cycle`.
+- The configured piecewise RUL cap is applied consistently to every split;
+  targets are divided by the cap for optimization and restored for reporting.
+- `options.include_cycle` adds the observed lifecycle cycle as a feature; its
+  normalization is fitted only on training engines.
+- Integer cycle IDs are also returned as non-feature metadata for the
+  cycle-aware long expert, regardless of `include_cycle`.
+- Official testing uses the final observed window and supplied `RUL_FD*.txt`
+  target for each test engine.
+
+Trajectory columns are interpreted as engine ID, cycle, three operating
+settings, and 21 sensor measurements. Engine ID is never a model feature.
+
+### N-CMAPSS
+
+Place the official HDF5 files under `dataset/n-cmapss/`. A subset is loaded
+lazily, so feature windows are read on demand rather than materializing a
+multi-gigabyte file in memory.
+
+- Development units are split into disjoint train/validation units.
+- Official test units never contribute preprocessing statistics.
+- Statistics are fitted incrementally from chunks of training-unit rows.
+- The default observed inputs are `W` and `X_s`; `X_v` may be enabled.
+- Health parameters in `T` are rejected as inputs to avoid target leakage.
+- Windows stay inside a unit and can downsample the original 1 Hz stream.
+- `options.include_cycle` adds the observed flight cycle from `A` as a
+  train-statistics-normalized lifecycle-position feature.
+- The same raw cycle column is returned separately as integer metadata for
+  cycle grouping; it is never normalized or exposed as an extra feature.
+- `data.options.include_partial_windows` controls one shared train/validation/test
+  policy and defaults to `false`, so all splits use complete windows.
+- Test predictions cover each unit trajectory at `evaluation_stride`, plus its
+  final row, and are streamed to JSON Lines.
+
+The adapter checks required datasets, aligned row counts, feature names, and
+contiguous unit spans before training.
+
+RMSE, MAE, MSE, NASA Score, prediction files, and plots are all reported in
+the original RUL unit even though capped labels are normalized during training.
+
+The current local `N-CMAPSS_DS08d-010.h5` file has inconsistent HDF5 end-of-file
+metadata and is not usable. An `all` batch skips unreadable files with a
+diagnostic. The reference configuration uses DS02-006 and is unaffected.
 
 ## Setup
 
-From this repository root:
+The existing virtual environment can be used directly:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-For an editable install from the direct dependencies in `pyproject.toml`:
+Python 3.10 or newer and the direct dependencies in `pyproject.toml` are
+supported.
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e .
-```
+## Training
 
-Or use any Python 3.10+ environment with the declared dependencies.
-
-## Train
-
-Training and evaluation accept one required YAML configuration and no individual
-hyperparameter flags. Reference configurations are provided for both models:
-
-```powershell
-.\.venv\Scripts\python.exe -m scripts.train --config configs\cmapss_ttt.yaml
-```
+C-MAPSS FD004 experiment:
 
 ```powershell
 .\.venv\Scripts\python.exe -m scripts.train --config configs\cmapss_transformer.yaml
 ```
 
-Decoder-only TTT with autoregressive continuous-feature training:
+N-CMAPSS DS02 experiment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m scripts.train --config configs\cmapss_ttt_decoder.yaml
-```
-
-N-CMAPSS reference runs:
-
-```powershell
-.\.venv\Scripts\python.exe -m scripts.train --config configs\ncmapss_ttt.yaml
 .\.venv\Scripts\python.exe -m scripts.train --config configs\ncmapss_transformer.yaml
 ```
 
-The YAML sections are:
+### Batch experiments
 
-| Section | Contents |
-| --- | --- |
-| `experiment` | Run name and output directory |
-| `data` | Adapter name, subset, window, RUL cap/filter, validation and sampling |
-| `data.options` | Dataset-specific feature groups, downsampling and boundaries |
-| `model` | Backbone type, encoder/decoder architecture, width, depth, heads |
-| `model.autoregressive` | Next-feature loss type and objective weight |
-| `model.ttt` | qkv bias, inner step, scale, CPE kernel, chunk and state mode |
-| `training` | Optimizer, runtime precision/compilation, early stop, seed and limits |
-| `evaluation` | Checkpoint, device, output files, engine limit, plots |
-
-`data.split_seed` controls only the engine split. `training.seed` controls model
-initialization, batch shuffling, and runtime randomness, so initialization seeds
-can be varied while keeping exactly the same train/validation engines.
-
-`training.precision` accepts `fp32`, `bf16`, or `auto`; `auto` selects BF16 on a
-compatible CUDA GPU and otherwise keeps FP32. Model parameters and TTT inner
-gradient/state statistics remain FP32 under autocast. `training.compile` enables
-in-place `torch.compile` without changing checkpoint keys. It is disabled in the
-portable reference configs because compilation support depends on the PyTorch
-platform; enable it on a supported Linux CUDA server after a short smoke test.
-Pinned-memory loaders use asynchronous CUDA transfers, and worker loaders
-prefetch batches automatically. The N-CMAPSS references use four workers and
-non-deterministic kernels for throughput; set `deterministic: true` when exact
-repeatability is more important than speed.
-
-Both variants share input projection, padding behavior, last-valid-token pooling,
-final normalization, RUL head, data split, optimizer, metrics, checkpoint format,
-and visualizations. The standard variant uses dynamic sinusoidal positions and
-PyTorch pre-norm `TransformerEncoderLayer`; TTT uses CPE plus the ViTTT-derived
-layer. TTT-only settings live under `model.ttt` and are rejected for a standard
-Transformer configuration.
-
-`model.architecture` defaults to `encoder`, preserving existing configurations
-and checkpoints. Set it to `decoder` for causal processing. Decoder mode can
-enable `model.autoregressive`: hidden state `t` predicts standardized feature
-vector `t+1`, while the last valid hidden state predicts endpoint RUL. The
-shared loop optimizes `RUL_MSE + weight * next_feature_loss`; early stopping
-remains based on RUL MSE, while feature loss, RMSE, and MAE are also reported.
-For a fair causal attention baseline, use `model.type: transformer`, keep the
-decoder/autoregressive settings, and omit `model.ttt`.
-
-The TTT decoder configurations enable engine-level state with:
-
-```yaml
-model:
-  architecture: decoder
-  ttt:
-    chunk_size: 32
-    continuous_state: true
-```
-
-In this mode, training shuffling is disabled automatically. Consecutive windows
-from the same engine are collapsed to their unique new-token stream inside each
-batch, RUL predictions are gathered at the original window endpoints, state is
-detached at batch boundaries, and a new engine starts from an empty state. The
-default `continuous_state: false` retains independent-window behavior and old
-checkpoint compatibility.
-
-For official C-MAPSS endpoint testing, the continuous decoder consumes the
-complete observed test trajectory once and reports only its final RUL; this is
-numerically the same causal stream as incremental windows without repeatedly
-feeding their overlap. N-CMAPSS retains its all-window protocol and carries the
-same state across successive windows and flights of one unit.
-
-`data.name` selects `cmapss` or `ncmapss`; older C-MAPSS YAML files without this
-field default to `cmapss`. `data.stride` controls training/validation endpoints,
-while `data.evaluation_stride` independently controls full-trajectory testing.
-For N-CMAPSS, `evaluation.max_test_batches` is available for smoke tests;
-partial metrics are not benchmark-comparable.
-
-Copy a reference YAML and change `data.subset` and `experiment.output_dir` for
-FD002, FD003, or FD004. With `evaluation.checkpoint: null`, evaluation uses
-`experiment.output_dir/best.pt` automatically.
-
-For resume, set `training.resume` to `outputs/.../last.pt`, keep
-`experiment.output_dir` at the checkpoint directory, and set `training.epochs`
-to the new total epoch count. Resume uses the checkpoint model, split, and
-preprocessing state.
-
-Resume re-seeds from `training.seed`, but checkpoints do not preserve the
-exact Python/NumPy/PyTorch/DataLoader RNG stream positions; it is reproducible
-as a resumed run, not bitwise-identical to an uninterrupted run.
-
-## Evaluate
+The repository-root launchers build a Cartesian product of selected subsets
+and sequence mixers. Run either launcher without arguments for interactive
+prompts:
 
 ```powershell
-.\.venv\Scripts\python.exe -m scripts.evaluate --config configs\cmapss_ttt.yaml
-.\.venv\Scripts\python.exe -m scripts.evaluate --config configs\ncmapss_ttt.yaml
+.\run_experiments.bat
 ```
 
-The training and evaluation commands also print parameter count and analytical
-forward MACs/FLOPs for one configured input window. Evaluation writes the same
-complexity summary alongside RMSE, MAE, NASA Score, and MSE loss. By default,
-metrics use the checkpoint's RUL-cap policy. `evaluation.max_test_engines` is
-intended only for smoke tests because a partial NASA Score is not
-benchmark-comparable. Set `training.plots` or `evaluation.plots` to `false` to
-disable automatic PNG generation.
+```bash
+bash run_experiments.sh
+```
 
-Autoregressive decoders additionally report teacher-forced next-feature loss,
-RMSE, and MAE on valid transitions. These values use standardized feature space;
-the benchmark RUL metrics and prediction files retain their existing semantics.
-
-Plots can also be regenerated from saved JSON files:
+Selections can also be passed directly. For example, compare the original and
+multiscale TTT mixers on two C-MAPSS subsets:
 
 ```powershell
-.\.venv\Scripts\python.exe -m scripts.visualize --run-dir outputs\fd002_ttt
+.\run_experiments.bat --dataset cmapss --subsets FD001,FD002 --mixers ttt_mlp,ttt_multiscale_moe
 ```
 
-Each training output directory contains:
+```bash
+bash run_experiments.sh --dataset cmapss --subsets FD001,FD002 --mixers ttt_mlp,ttt_multiscale_moe
+```
+
+Run TTT-MLP on every usable N-CMAPSS file:
+
+```powershell
+.\run_experiments.bat --dataset ncmapss --subsets all --mixers ttt_mlp
+```
+
+On a four-GPU server, add `--gpus 0,1,2,3` to run at most four independent
+experiments concurrently, with one process isolated to each GPU:
+
+```bash
+bash run_experiments.sh --dataset cmapss --subsets all --mixers attention,ttt_mlp --gpus 0,1,2,3
+```
+
+If memory permits multiple experiments on each GPU, set a numeric concurrency
+or use `all`. For the eight C-MAPSS combinations below, `all` resolves to two
+jobs per GPU and starts the complete matrix concurrently:
+
+```bash
+bash run_experiments.sh --dataset cmapss --subsets all --mixers attention,ttt_mlp --gpus 0,1,2,3 --jobs-per-gpu all
+```
+
+Use `--jobs-per-gpu 2` for an explicit two jobs per GPU. This is a trust-based
+capacity setting rather than dynamic memory reservation; choose it only after
+confirming peak memory usage. Running many N-CMAPSS jobs together can also be
+limited by HDF5 storage bandwidth and host memory even when GPU memory is free.
+
+The same option works with the Windows launcher. Without `--gpus`, execution
+remains serial, and `--gpus` alone defaults to one job per GPU. Parallel console
+output is written to `train.log` inside each experiment directory so messages
+from different processes do not interleave.
+Keep `training.device` and `evaluation.device` set to `auto` (the reference
+default); inside each isolated process the assigned physical GPU appears as
+`cuda:0`.
+
+Use `--dataset all --subsets all --mixers all` for the complete matrix, or add
+`--dry-run` to inspect generated combinations without training. Each batch is
+grouped under one timestamp directory:
+
+```text
+outputs/batches/YYYYMMDD_HHMMSS/
+  configs/                        generated launch configurations
+  cmapss_fd001_attention/         complete attention run
+  cmapss_fd001_ttt_mlp/           complete TTT-MLP run
+  cmapss_fd001_ttt_multiscale_moe/ complete multiscale TTT run
+  ...
+  summary.csv                     accuracy and complexity comparison
+```
+
+`summary.csv` records RMSE, MAE, MSE, NASA Score, observed cycles per window,
+multi-cycle coverage, parameter counts, analytical per-sample MACs/FLOPs, and
+differences or ratios relative to attention for the same dataset subset. The
+cycle fields make long-expert activation coverage explicit. The MoE estimate
+uses the full sequence length as a conservative upper bound for the
+data-dependent slow sequence; it does not model Python-loop, synchronization,
+or kernel-launch overhead. An unreadable N-CMAPSS
+HDF5 file is rejected when selected explicitly and skipped with a diagnostic
+message during an `all` run.
+
+Change `model.sequence_mixer` in the same file to compare `attention`,
+`ttt_mlp`, and `ttt_multiscale_moe` while retaining the identical data split,
+model backbone, optimizer, metrics, and evaluation protocol. Also change
+`experiment.name` and `experiment.output_dir` so runs do not overwrite one
+another. The command trains the model, restores the best validation checkpoint,
+and evaluates the official test split.
+
+`training.precision: auto` selects BF16 on a compatible CUDA device and FP32
+otherwise. Model parameters, optimization, and TTT fast-weight updates remain
+FP32. Batch limits are available for integration smoke runs; metrics from
+partial runs are not benchmark-comparable.
+
+To resume, set `training.resume` to the prior `last.pt`, retain the same output
+directory, and increase `training.epochs` to the desired total epoch count.
+
+## Evaluation and visualization
+
+Evaluate the configured checkpoint, or `best.pt` in the output directory when
+`evaluation.checkpoint` is null:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.evaluate --config configs\cmapss_transformer.yaml
+```
+
+Regenerate plots from saved JSON/JSONL output:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.visualize --run-dir outputs\cmapss_fd004_ttt_multiscale_moe
+```
+
+Each completed run contains:
 
 ```text
 best.pt                 best validation-MSE checkpoint
-last.pt                 latest checkpoint, including optimizer state
-config.yaml             normalized configuration used by the run
-history.json            per-epoch train/validation metrics
-test_metrics.json       endpoint test metrics and label policy
-test_predictions.json   endpoint predictions for C-MAPSS
-test_predictions.jsonl  streamed full-trajectory predictions for N-CMAPSS
-training_history.png    training and validation loss/RMSE curves
-test_predictions.png    endpoint trend and prediction parity plot
+last.pt                 latest checkpoint and optimizer state
+config.yaml             normalized run configuration
+history.json            epoch-level training and validation metrics
+test_metrics.json       RUL metrics and complexity summary
+test_predictions.json   C-MAPSS endpoint predictions
+test_predictions.jsonl  N-CMAPSS streamed trajectory predictions
+training_history.png    loss/RMSE curves
+test_predictions.png    prediction sequence and parity plots
 ```
-
-## Model shapes
-
-For input feature count `F`, window length `L`, model width `C`, `H` heads, and
-head width `D=C/H`:
-
-| Model | Sequence encoder |
-| --- | --- |
-| `ttt` | CPE + sample-local closed-form TTT update + FFN |
-| `transformer` | Dynamic sinusoidal positions + multi-head self-attention + FFN |
-
-| Stage | Shape |
-| --- | --- |
-| Dataset batch | `[B,L,F]`, mask `[B,L]` |
-| Input projection / blocks | `[B,L,C]` |
-| Standard attention q/k/v | `[B,H,L,D]` |
-| TTT SwiGLU q/k/v | `[B,H,L,D]` |
-| TTT temporal q/k/v | `[B,D,L]` |
-| TTT per-sample fast w1/w2 | `[B,H,D,D]` |
-| TTT per-sample fast w3 | `[B*D,1,3]` |
-| Regression output | `[B]` |
-| Decoder next-feature output | `[B,L,F]` |
-
-During teacher forcing, positions `0..L-2` are compared with input features
-`1..L-1`; transitions touching padding are excluded. Continuous measurements
-are predicted directly rather than quantized into artificial token bins.
 
 ## Project layout
 
 ```text
-data/
-  base.py               shared adapter, bundle, evaluation, and RUL-filter contracts
-  registry.py           explicit dataset adapter registry
-  preprocessing.py      streaming feature variance and normalization state
-  cmapss.py             parsing, split, scaling, RUL, windows
-  ncmapss.py            lazy HDF5 schema, preprocessing, splits, and windows
 configs/
-  cmapss_ttt.yaml       C-MAPSS TTT experiment
-  cmapss_ttt_decoder.yaml C-MAPSS causal TTT decoder experiment
-  cmapss_transformer.yaml C-MAPSS standard Transformer experiment
-  ncmapss_ttt.yaml      N-CMAPSS TTT experiment
-  ncmapss_transformer.yaml N-CMAPSS standard Transformer experiment
+  cmapss_transformer.yaml
+  ncmapss_transformer.yaml
+data/
+  base.py               shared dataset bundle contract
+  preprocessing.py      streaming statistics and feature scaler
+  cmapss.py             C-MAPSS parsing, split, labels, and windows
+  ncmapss.py            lazy HDF5 schema, split, scaling, and windows
+  registry.py           explicit adapter selection
 models/
-  ttt_layer.py          ViTTT-derived temporal TTT layer
-  rul_transformer.py    shared RUL backbone, TTT and standard Transformer blocks
+  rul_transformer.py    shared Transformer blocks and mixer registry
+  ttt_layer.py          shared TTT core, standard MLP, and multiscale MoE
 utils/
-  config.py             typed YAML loading and strict validation
-  complexity.py         parameter and analytical MAC/FLOP estimates
-  metrics.py            RMSE, MAE, NASA Score
-  engine.py             training, evaluation, checkpoints, reset lifecycle
-  visualization.py      history and endpoint prediction plots
+  config.py             strict YAML loading and validation
+  complexity.py         parameter and analytical operation counts
+  metrics.py            regression and NASA metrics
+  engine.py             training, evaluation, and checkpoints
+  visualization.py      training and prediction figures
 scripts/
-  train.py              training/resume/test CLI
-  evaluate.py           checkpoint-only official test CLI
-  visualize.py          regenerate plots from saved JSON
-THIRD_PARTY_NOTICES.md
-requirements.txt
+  train.py
+  evaluate.py
+  visualize.py
 ```

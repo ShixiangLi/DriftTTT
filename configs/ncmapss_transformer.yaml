@@ -1,0 +1,71 @@
+experiment:
+  name: ncmapss_ds02_ttt_multiscale_moe
+  output_dir: outputs/ncmapss_ds02_ttt_multiscale_moe
+
+data:
+  name: ncmapss
+  root: dataset/n-cmapss
+  subset: DS02-006
+  window_size: 512
+  stride: 512
+  evaluation_stride: 512
+  validation_fraction: 0.33
+  split_seed: 42
+  rul_cap: 125
+  variance_threshold: 1.0e-12
+  batch_size: 128
+  num_workers: 2
+  pin_memory: true
+  options:
+    feature_groups: [W, X_s]
+    include_cycle: true
+    include_partial_windows: false
+    downsample: 10
+    chunk_rows: 262144
+
+model:
+  type: transformer
+  sequence_mixer: ttt_multiscale_moe  # attention | ttt_mlp | ttt_multiscale_moe
+  d_model: 128
+  nhead: 4
+  num_layers: 4
+  dim_feedforward: 256
+  dropout: 0.1
+  activation: gelu
+  norm_first: true
+  ttt:
+    hidden_multiplier: 2.0
+    inner_learning_rate: 0.1
+    chunk_size: 16
+    inner_gradient_clip: 1.0
+    activation: silu
+    qkv_bias: true
+    multiscale:
+      short_rank_ratio: 0.7
+      long_ema_decay: 0.0  # cycle means already form the slow representation
+      long_update_interval: 4  # slow states per long-expert update
+      long_inner_learning_rate: 0.025
+      center_long_residual: true  # preserve the absolute-health query anchor
+
+training:
+  epochs: 60
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  device: auto
+  precision: auto
+  gradient_clip: 1.0
+  seed: 42
+  deterministic: false
+  early_stopping_patience: 12
+  resume: null
+  max_train_batches: null
+  max_validation_batches: null
+  plots: true
+
+evaluation:
+  checkpoint: null
+  device: auto
+  max_test_batches: null
+  metrics_file: test_metrics.json
+  predictions_file: test_predictions.jsonl
+  plots: true

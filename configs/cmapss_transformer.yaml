@@ -1,0 +1,68 @@
+experiment:
+  name: cmapss_fd004_ttt_multiscale_moe
+  output_dir: outputs/cmapss_fd004_ttt_multiscale_moe
+
+data:
+  name: cmapss
+  root: dataset/cmapss
+  subset: FD004
+  window_size: 60
+  stride: 1
+  evaluation_stride: 1
+  validation_fraction: 0.2
+  split_seed: 42
+  rul_cap: 125
+  variance_threshold: 1.0e-12
+  batch_size: 128
+  num_workers: 4
+  pin_memory: true
+  options:
+    include_settings: true
+    include_cycle: true
+
+model:
+  type: transformer
+  sequence_mixer: ttt_multiscale_moe  # attention | ttt_mlp | ttt_multiscale_moe
+  d_model: 64
+  nhead: 4
+  num_layers: 3
+  dim_feedforward: 128
+  dropout: 0.1
+  activation: gelu
+  norm_first: true
+  ttt:
+    hidden_multiplier: 2.0
+    inner_learning_rate: 0.1
+    chunk_size: 10
+    inner_gradient_clip: 1.0
+    activation: silu
+    qkv_bias: true
+    multiscale:
+      short_rank_ratio: 0.5
+      long_ema_decay: 0.9
+      long_update_interval: 3  # slow states per long-expert update
+      long_inner_learning_rate: 0.025
+      center_long_residual: true  # preserve the absolute-health query anchor
+
+training:
+  epochs: 60
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  device: auto
+  precision: auto
+  gradient_clip: 1.0
+  seed: 42
+  deterministic: false
+  early_stopping_patience: 12
+  resume: null
+  max_train_batches: null
+  max_validation_batches: null
+  plots: true
+
+evaluation:
+  checkpoint: null
+  device: auto
+  max_test_batches: null
+  metrics_file: test_metrics.json
+  predictions_file: test_predictions.json
+  plots: true
