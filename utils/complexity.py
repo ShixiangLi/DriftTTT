@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import ceil
 from typing import Any
 
 from torch import nn
@@ -13,8 +14,9 @@ def model_complexity(
 ) -> dict[str, int]:
     """Return parameters and analytical per-sample MAC estimates.
 
-    Cycle-aware slow lengths depend on sample metadata, so the multiscale
-    estimate conservatively uses the maximum possible number of cycles.
+    Segment-clock slow lengths can gain an extra token at cycle resets. The
+    multiscale estimate uses the nominal fixed-segment length and excludes this
+    small data-dependent boundary effect.
     """
     parameters = sum(parameter.numel() for parameter in model.parameters())
     trainable = sum(
@@ -44,13 +46,12 @@ def model_complexity(
             short_dim = int(round(inner_dim * float(multiscale["short_rank_ratio"])))
             short_dim = min(max(1, short_dim), inner_dim - 1)
             long_dim = inner_dim - short_dim
-            slow_length = length
+            slow_length = ceil(length / int(multiscale["long_segment_size"]))
             fast_mlp_and_update = (
                 7 * heads * head_dim * (length * short_dim + slow_length * long_dim)
             )
-            # Cycle grouping, smoothing, routing, and fusion remain linear in
-            # the original sequence length. Actual N-CMAPSS slow lengths are
-            # normally much smaller than this conservative upper bound.
+            # Segment grouping, routing, and fusion remain linear in the
+            # original sequence length.
             mixer_macs = projections + fast_mlp_and_update + 9 * length * width
     else:
         raise ValueError(f"Unsupported sequence mixer: {mixer}")

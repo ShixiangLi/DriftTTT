@@ -39,8 +39,9 @@ model:
     qkv_bias: true
     multiscale:
       short_rank_ratio: 0.5
-      long_ema_decay: 0.9
-      long_update_interval: 3  # slow states per long-expert update
+      long_segment_size: 10  # observations per long-expert segment
+      reset_segment_on_cycle: false  # C-MAPSS has one row per lifecycle cycle
+      long_update_interval: 3  # segment states per long-expert update
       long_inner_learning_rate: 0.025
       center_long_residual: true  # preserve the absolute-health query anchor
 

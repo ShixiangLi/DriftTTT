@@ -296,12 +296,13 @@ class TTTMLP(_TTTMLPBase):
 
 
 class TTTMultiscaleMoE(_TTTMLPBase):
-    """Cycle-aware TTT mixer formed by partitioning one fast MLP rank budget.
+    """Segment-clock TTT mixer formed by partitioning one fast MLP rank budget.
 
     The short expert models base-token high-frequency variation. The long expert
-    operates on contiguous cycle summaries. Its gated contribution is centered
-    over valid observations so that the query path retains absolute health.
-    Both experts partition one fixed hidden rank.
+    operates on means of fixed-size contiguous observation segments. Segment
+    boundaries can reset at physical cycle transitions. Its gated contribution
+    is centered over valid observations so that the query path retains absolute
+    health. Both experts partition one fixed hidden rank.
     """
 
     def __init__(self, d_model: int, nhead: int, config: dict[str, Any]) -> None:
@@ -319,10 +320,11 @@ class TTTMultiscaleMoE(_TTTMLPBase):
         self.short_hidden_dim = min(max(1, self.short_hidden_dim), self.hidden_dim - 1)
         self.short_rank_ratio = self.short_hidden_dim / self.hidden_dim
         self.short_chunk_size = int(config["chunk_size"])
+        self.long_segment_size = int(multiscale["long_segment_size"])
+        self.reset_segment_on_cycle = bool(multiscale["reset_segment_on_cycle"])
         self.long_update_interval = int(multiscale["long_update_interval"])
         self.short_learning_rate = float(config["inner_learning_rate"])
         self.long_learning_rate = float(multiscale["long_inner_learning_rate"])
-        self.long_ema_decay = float(multiscale["long_ema_decay"])
         self.center_long_residual = bool(multiscale["center_long_residual"])
 
         self.fast_w1 = nn.Parameter(torch.empty(nhead, self.head_dim, self.hidden_dim))
@@ -354,7 +356,7 @@ class TTTMultiscaleMoE(_TTTMLPBase):
         aligned.scatter_add_(1, valid_rank, cycle_ids.clamp_min(0) * mask)
         return aligned.masked_fill(~aligned_mask, -1)
 
-    def _cycle_slow_clock(
+    def _segment_slow_clock(
         self,
         values: torch.Tensor,
         valid_mask: torch.Tensor,
@@ -364,60 +366,48 @@ class TTTMultiscaleMoE(_TTTMLPBase):
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Aggregate contiguous tokens on the physical engine-cycle clock."""
+        """Aggregate contiguous tokens on the configured segment clock."""
         previous_valid = torch.cat(
             (torch.zeros_like(valid_mask[:, :1]), valid_mask[:, :-1]), dim=1
         )
         previous_cycle = torch.cat((cycle_ids[:, :1], cycle_ids[:, :-1]), dim=1)
-        boundary = valid_mask & (~previous_valid | (cycle_ids != previous_cycle))
+        sequence_start = valid_mask & ~previous_valid
+        cycle_start = (
+            valid_mask
+            & previous_valid
+            & (cycle_ids != previous_cycle)
+            & self.reset_segment_on_cycle
+        )
+        segment_anchor = sequence_start | cycle_start
+        positions = torch.arange(
+            valid_mask.shape[1], device=valid_mask.device
+        ).unsqueeze(0)
+        anchor_positions = torch.where(
+            segment_anchor, positions, positions.new_full((), -1)
+        )
+        last_anchor = anchor_positions.cummax(dim=1).values
+        offset = (positions - last_anchor).clamp_min(0)
+        boundary = valid_mask & (
+            segment_anchor | (offset.remainder(self.long_segment_size) == 0)
+        )
         group_index = boundary.long().cumsum(dim=1).sub(1).clamp_min(0)
         group_count = int(boundary.sum(dim=1).max().item())
         if group_count < 1:
-            raise ValueError("Every TTT sample must contain at least one cycle")
+            raise ValueError("Every TTT sample must contain at least one segment")
 
         index = group_index[:, :, None, None].expand(
             -1, -1, values.shape[2], values.shape[3]
         )
         valid = valid_mask[:, :, None, None].to(values.dtype)
-        cycle_sum = values.new_zeros(
+        segment_sum = values.new_zeros(
             values.shape[0], group_count, values.shape[2], values.shape[3]
         )
-        cycle_sum.scatter_add_(1, index, values * valid)
+        segment_sum.scatter_add_(1, index, values * valid)
         durations = values.new_zeros(values.shape[0], group_count)
         durations.scatter_add_(1, group_index, valid_mask.to(values.dtype))
-        cycle_mask = durations > 0
-        cycle_mean = cycle_sum / durations.clamp_min(1)[:, :, None, None]
-        if self.long_ema_decay == 0.0:
-            return cycle_mean, cycle_mask, group_index
-
-        cycle_numbers = cycle_ids.new_zeros(values.shape[0], group_count)
-        cycle_numbers.scatter_add_(1, group_index, cycle_ids.clamp_min(0) * boundary)
-        previous_numbers = torch.cat(
-            (torch.zeros_like(cycle_numbers[:, :1]), cycle_numbers[:, :-1]), dim=1
-        )
-        transition_steps = (cycle_numbers - previous_numbers).clamp_min(1)
-
-        state = torch.zeros_like(cycle_mean[:, 0])
-        initialized = torch.zeros(
-            values.shape[0], device=values.device, dtype=torch.bool
-        )
-        slow_states = []
-        decay = values.new_tensor(self.long_ema_decay)
-        for index_value in range(group_count):
-            active = cycle_mask[:, index_value]
-            gap = transition_steps[:, index_value]
-            cycle_decay = decay.pow(gap.to(values.dtype))[:, None, None]
-            current_mean = cycle_mean[:, index_value]
-            updated = cycle_decay * state + (1.0 - cycle_decay) * current_mean
-            updated = torch.where(initialized[:, None, None], updated, current_mean)
-            state = torch.where(active[:, None, None], updated, state)
-            slow_states.append(state * active[:, None, None])
-            initialized = initialized | active
-        return (
-            torch.stack(slow_states, dim=1),
-            cycle_mask,
-            group_index,
-        )
+        segment_mask = durations > 0
+        segment_mean = segment_sum / durations.clamp_min(1)[:, :, None, None]
+        return segment_mean, segment_mask, group_index
 
     @staticmethod
     def _broadcast_slow(
@@ -458,9 +448,13 @@ class TTTMultiscaleMoE(_TTTMLPBase):
         cycle_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self._validate_inputs(inputs, mask)
-        if cycle_ids is None or cycle_ids.shape != mask.shape:
-            raise ValueError("Cycle-aware MoE-TTT requires cycle_ids with shape [B,L]")
-        if torch.any(cycle_ids[mask] < 0):
+        if cycle_ids is not None and cycle_ids.shape != mask.shape:
+            raise ValueError("Expected cycle_ids with shape [B,L]")
+        if self.reset_segment_on_cycle and cycle_ids is None:
+            raise ValueError(
+                "Cycle-aligned segments require cycle_ids with shape [B,L]"
+            )
+        if cycle_ids is not None and torch.any(cycle_ids[mask] < 0):
             raise ValueError("Valid TTT tokens require non-negative cycle_ids")
         input_dtype = inputs.dtype
         with torch.autocast(device_type=inputs.device.type, enabled=False):
@@ -468,33 +462,40 @@ class TTTMultiscaleMoE(_TTTMLPBase):
                 inputs, mask
             )
             aligned_cycles = self._align_cycle_ids(
-                cycle_ids, mask, valid_rank, aligned_mask
+                (
+                    cycle_ids
+                    if cycle_ids is not None
+                    else torch.zeros_like(mask, dtype=torch.int64)
+                ),
+                mask,
+                valid_rank,
+                aligned_mask,
             )
             cycle_delta = aligned_cycles[:, 1:] - aligned_cycles[:, :-1]
             adjacent_valid = aligned_mask[:, 1:] & aligned_mask[:, :-1]
-            if torch.any(cycle_delta[adjacent_valid] < 0):
+            if cycle_ids is not None and torch.any(cycle_delta[adjacent_valid] < 0):
                 raise ValueError("cycle_ids must be non-decreasing within a window")
             combined = torch.cat((queries, keys, values), dim=-1)
             (
-                slow_components,
-                slow_mask,
+                long_components,
+                long_mask,
                 group_index,
-            ) = self._cycle_slow_clock(combined, aligned_mask, aligned_cycles)
+            ) = self._segment_slow_clock(combined, aligned_mask, aligned_cycles)
             long_broadcast = self._broadcast_slow(
-                slow_components, group_index, aligned_mask
+                long_components, group_index, aligned_mask
             )
             short_components = combined - long_broadcast
             short_queries, short_keys, short_values = short_components.split(
                 self.head_dim, dim=-1
             )
-            long_queries, long_keys, long_values = slow_components.split(
+            long_queries, long_keys, long_values = long_components.split(
                 self.head_dim, dim=-1
             )
             short_update_keys, short_targets, short_update_mask = (
                 self._reconstruction_objective(short_keys, short_values, aligned_mask)
             )
             long_update_keys, long_targets, long_update_mask = (
-                self._reconstruction_objective(long_keys, long_values, slow_mask)
+                self._reconstruction_objective(long_keys, long_values, long_mask)
             )
 
             short_prior = self.short_rank_ratio
@@ -516,27 +517,27 @@ class TTTMultiscaleMoE(_TTTMLPBase):
                 self.short_chunk_size,
                 self.short_learning_rate,
             )
-            slow_residual, _ = self._run_expert(
+            segment_residual, _ = self._run_expert(
                 long_queries,
                 long_update_keys,
                 long_targets,
                 long_update_mask,
-                slow_mask,
+                long_mask,
                 long_state,
                 self.long_update_interval,
                 self.long_learning_rate,
             )
             long_residual = self._broadcast_slow(
-                slow_residual, group_index, aligned_mask
+                segment_residual, group_index, aligned_mask
             )
 
             gate_logits = torch.einsum(
                 "bshd,hd->bsh", queries, self.gate_weight
             ) / math.sqrt(self.head_dim)
             gate = torch.sigmoid(gate_logits + self.gate_bias)
-            has_cycle_transition = slow_mask.sum(dim=1) > 1
+            has_multiple_segments = long_mask.sum(dim=1) > 1
             gate = torch.where(
-                has_cycle_transition[:, None, None],
+                has_multiple_segments[:, None, None],
                 gate,
                 gate.new_full((), short_prior),
             )
@@ -544,7 +545,7 @@ class TTTMultiscaleMoE(_TTTMLPBase):
             long_scale = ((1.0 - gate) / (1.0 - short_prior)).unsqueeze(-1)
             long_contribution = long_scale * long_residual
             long_contribution = (
-                long_contribution * has_cycle_transition[:, None, None, None]
+                long_contribution * has_multiple_segments[:, None, None, None]
             )
             if self.center_long_residual:
                 long_contribution = self._center_valid_sequence(

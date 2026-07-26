@@ -206,6 +206,12 @@ def _write_summary_csv(
                 "partial": metrics["partial"],
                 "mean_cycles_per_window": metrics.get("mean_cycles_per_window", ""),
                 "multi_cycle_fraction": metrics.get("multi_cycle_fraction", ""),
+                "mean_segments_per_window": metrics.get(
+                    "mean_segments_per_window", ""
+                ),
+                "multi_segment_fraction": metrics.get(
+                    "multi_segment_fraction", ""
+                ),
                 "parameters": complexity["parameters"],
                 "trainable_parameters": complexity["trainable_parameters"],
                 "forward_macs_per_sample": complexity["forward_macs_per_sample"],

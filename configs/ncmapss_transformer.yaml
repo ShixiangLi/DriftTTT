@@ -42,8 +42,9 @@ model:
     qkv_bias: true
     multiscale:
       short_rank_ratio: 0.7
-      long_ema_decay: 0.0  # cycle means already form the slow representation
-      long_update_interval: 4  # slow states per long-expert update
+      long_segment_size: 64  # downsampled observations per long-expert segment
+      reset_segment_on_cycle: true  # never merge adjacent flight cycles
+      long_update_interval: 4  # segment states per long-expert update
       long_inner_learning_rate: 0.025
       center_long_residual: true  # preserve the absolute-health query anchor
 

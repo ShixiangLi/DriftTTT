@@ -44,7 +44,8 @@ DEFAULTS: dict[str, Any] = {
             "qkv_bias": True,
             "multiscale": {
                 "short_rank_ratio": 0.5,
-                "long_ema_decay": 0.9,
+                "long_segment_size": 64,
+                "reset_segment_on_cycle": True,
                 "long_update_interval": 4,
                 "long_inner_learning_rate": 0.025,
                 "center_long_residual": True,
@@ -197,8 +198,17 @@ def normalize_config(raw: dict[str, Any]) -> dict[str, Any]:
     multiscale = ttt["multiscale"]
     if not 0.0 < float(multiscale["short_rank_ratio"]) < 1.0:
         raise ValueError("model.ttt.multiscale.short_rank_ratio must be in (0, 1)")
-    if not 0.0 <= float(multiscale["long_ema_decay"]) < 1.0:
-        raise ValueError("model.ttt.multiscale.long_ema_decay must be in [0, 1)")
+    if (
+        not isinstance(multiscale["long_segment_size"], int)
+        or multiscale["long_segment_size"] < 1
+    ):
+        raise ValueError(
+            "model.ttt.multiscale.long_segment_size must be a positive integer"
+        )
+    if not isinstance(multiscale["reset_segment_on_cycle"], bool):
+        raise ValueError(
+            "model.ttt.multiscale.reset_segment_on_cycle must be a boolean"
+        )
     if (
         not isinstance(multiscale["long_update_interval"], int)
         or multiscale["long_update_interval"] < 1

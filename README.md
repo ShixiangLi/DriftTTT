@@ -32,19 +32,20 @@ across batches. TTT inner updates stay in FP32 under mixed precision.
 
 `ttt_multiscale_moe` partitions the same fast-MLP hidden rank between a short
 expert and a long expert instead of constructing two complete networks. The
-short expert receives the base-token high-frequency residual and adapts at the
-observation clock. Independent integer cycle metadata groups observations into
-physical cycle states for the long expert; it is never taken from the
-normalized cycle feature. Cycle means can be smoothed using the actual cycle
-gap, and each long result is mapped back to its source observations. A
-lightweight per-head gate fuses both outputs. QKV, output projections, and the
-total fast-MLP rank remain shared and fixed. Both experts use the same stable
-reconstruction objective at their respective clocks. The final gated long
-contribution can be centered over valid observations, so it expresses relative
-degradation shape without replacing the absolute-health query path. A sample
-with fewer than two observed cycles automatically bypasses the long correction.
-Short- and long-expert fast states are sample-local and discarded after every
-window.
+long clock splits valid observations into configurable fixed-size contiguous
+segments and averages Q, K, and V inside each segment. N-CMAPSS segments reset
+at physical flight-cycle boundaries, using independent integer cycle metadata
+rather than the normalized cycle feature. The short expert receives each
+base-token Q/K/V minus its segment mean, while the long expert receives the
+ordered segment means. Each long result is mapped back to its source
+observations, and a lightweight per-head gate fuses both outputs. QKV, output
+projections, and the total fast-MLP rank remain shared and fixed. Both experts
+use the same stable reconstruction objective at their respective clocks. The
+final gated long contribution can be centered over valid observations, so it
+expresses relative slow variation without replacing the absolute-health query
+path. A sample with fewer than two segments automatically bypasses the long
+correction. Short- and long-expert fast states are sample-local and discarded
+after every window.
 
 All TTT-MLP settings live in the same YAML:
 
@@ -59,20 +60,21 @@ model:
     qkv_bias: true
     multiscale:
       short_rank_ratio: 0.5
-      long_ema_decay: 0.9
+      long_segment_size: 64
+      reset_segment_on_cycle: true
       long_update_interval: 3
       long_inner_learning_rate: 0.025
       center_long_residual: true
 ```
 
 The common `inner_learning_rate` and `chunk_size` configure short-expert
-updates. `long_update_interval` is the number of cycle states in one long
-update. `long_ema_decay` is applied per lifecycle-cycle gap rather than per raw
-observation; zero uses observed cycle means directly. N-CMAPSS uses zero
-because cycle aggregation is already a strong low-pass operation, while
-C-MAPSS retains cross-cycle EMA smoothing. `center_long_residual=false`
-provides the absolute-offset ablation. These multiscale values are ignored by
-`attention` and `ttt_mlp`.
+updates. `long_segment_size` is the maximum number of valid observations
+averaged into one long token. `reset_segment_on_cycle=true` starts a fresh
+segment at each physical cycle transition; N-CMAPSS enables it so a segment
+never merges adjacent flights. C-MAPSS disables it because each lifecycle cycle
+has only one row. `long_update_interval` is the number of segment states in one
+long update. `center_long_residual=false` provides the absolute-offset
+ablation. These multiscale values are ignored by `attention` and `ttt_mlp`.
 
 All TTT mixers use only the label-free same-coordinate reconstruction task
 during their inner update. RUL labels are used exclusively by the outer
@@ -96,8 +98,8 @@ supported: FD001, FD002, FD003, and FD004.
   targets are divided by the cap for optimization and restored for reporting.
 - `options.include_cycle` adds the observed lifecycle cycle as a feature; its
   normalization is fitted only on training engines.
-- Integer cycle IDs are also returned as non-feature metadata for the
-  cycle-aware long expert, regardless of `include_cycle`.
+- Integer cycle IDs are also returned as non-feature metadata, regardless of
+  `include_cycle`.
 - Official testing uses the final observed window and supplied `RUL_FD*.txt`
   target for each test engine.
 
@@ -119,7 +121,8 @@ multi-gigabyte file in memory.
 - `options.include_cycle` adds the observed flight cycle from `A` as a
   train-statistics-normalized lifecycle-position feature.
 - The same raw cycle column is returned separately as integer metadata for
-  cycle grouping; it is never normalized or exposed as an extra feature.
+  resetting long-expert segment boundaries; it is never normalized or exposed
+  as an extra feature.
 - `data.options.include_partial_windows` controls one shared train/validation/test
   policy and defaults to `false`, so all splits use complete windows.
 - Test predictions cover each unit trajectory at `evaluation_stride`, plus its
@@ -233,13 +236,14 @@ outputs/batches/YYYYMMDD_HHMMSS/
   summary.csv                     accuracy and complexity comparison
 ```
 
-`summary.csv` records RMSE, MAE, MSE, NASA Score, observed cycles per window,
-multi-cycle coverage, parameter counts, analytical per-sample MACs/FLOPs, and
-differences or ratios relative to attention for the same dataset subset. The
-cycle fields make long-expert activation coverage explicit. The MoE estimate
-uses the full sequence length as a conservative upper bound for the
-data-dependent slow sequence; it does not model Python-loop, synchronization,
-or kernel-launch overhead. An unreadable N-CMAPSS
+`summary.csv` records RMSE, MAE, MSE, NASA Score, observed cycles and long
+segments per window, multi-cycle and multi-segment coverage, parameter counts,
+analytical per-sample MACs/FLOPs, and differences or ratios relative to
+attention for the same dataset subset. The segment fields make long-expert
+activation coverage explicit. The MoE estimate uses the nominal
+`ceil(window_size / long_segment_size)` slow length; cycle-boundary resets can
+add a small data-dependent number of segment tokens. It does not model
+Python-loop, synchronization, or kernel-launch overhead. An unreadable N-CMAPSS
 HDF5 file is rejected when selected explicitly and skipped with a diagnostic
 message during an `all` run.
 

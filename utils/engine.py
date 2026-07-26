@@ -129,6 +129,46 @@ def _observed_cycle_counts(cycle_ids: torch.Tensor, mask: torch.Tensor) -> torch
     return mask.any(dim=1).long() + transitions.sum(dim=1)
 
 
+def _multiscale_segment_settings(
+    model: RULTransformer,
+) -> tuple[int, bool] | None:
+    if model.sequence_mixer != "ttt_multiscale_moe":
+        return None
+    mixer = model.blocks[0].sequence_mixer
+    return int(mixer.long_segment_size), bool(mixer.reset_segment_on_cycle)
+
+
+def _observed_segment_counts(
+    cycle_ids: torch.Tensor,
+    mask: torch.Tensor,
+    segment_size: int,
+    reset_on_cycle: bool,
+) -> torch.Tensor:
+    """Count long-expert segments using the model's boundary policy."""
+    previous_valid = torch.cat(
+        (torch.zeros_like(mask[:, :1]), mask[:, :-1]), dim=1
+    )
+    previous_cycle = torch.cat((cycle_ids[:, :1], cycle_ids[:, :-1]), dim=1)
+    sequence_start = mask & ~previous_valid
+    cycle_start = (
+        mask
+        & previous_valid
+        & (cycle_ids != previous_cycle)
+        & reset_on_cycle
+    )
+    segment_anchor = sequence_start | cycle_start
+    positions = torch.arange(mask.shape[1], device=mask.device).unsqueeze(0)
+    anchor_positions = torch.where(
+        segment_anchor, positions, positions.new_full((), -1)
+    )
+    last_anchor = anchor_positions.cummax(dim=1).values
+    offset = (positions - last_anchor).clamp_min(0)
+    segment_start = mask & (
+        segment_anchor | (offset.remainder(segment_size) == 0)
+    )
+    return segment_start.sum(dim=1)
+
+
 def _run_epoch(
     model: RULTransformer,
     loader: DataLoader,
@@ -145,6 +185,10 @@ def _run_epoch(
     cycle_count_sum = torch.zeros((), device=device, dtype=torch.int64)
     multi_cycle_count = torch.zeros((), device=device, dtype=torch.int64)
     cycle_window_count = 0
+    segment_settings = _multiscale_segment_settings(model)
+    segment_count_sum = torch.zeros((), device=device, dtype=torch.int64)
+    multi_segment_count = torch.zeros((), device=device, dtype=torch.int64)
+    segment_window_count = 0
     objective_sum = torch.zeros((), device=device)
     sample_count = 0
     for batch_index, batch in enumerate(loader):
@@ -160,6 +204,13 @@ def _run_epoch(
             cycle_count_sum += observed_cycles.sum()
             multi_cycle_count += (observed_cycles > 1).sum()
             cycle_window_count += observed_cycles.numel()
+            if segment_settings is not None:
+                observed_segments = _observed_segment_counts(
+                    cycle_ids, mask, *segment_settings
+                )
+                segment_count_sum += observed_segments.sum()
+                multi_segment_count += (observed_segments > 1).sum()
+                segment_window_count += observed_segments.numel()
         targets = batch["target"].to(device, non_blocking=True)
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -189,6 +240,13 @@ def _run_epoch(
         ).item()
         result["multi_cycle_fraction"] = (
             multi_cycle_count.float() / cycle_window_count
+        ).item()
+    if segment_window_count:
+        result["mean_segments_per_window"] = (
+            segment_count_sum.float() / segment_window_count
+        ).item()
+        result["multi_segment_fraction"] = (
+            multi_segment_count.float() / segment_window_count
         ).item()
     return result
 
@@ -251,6 +309,10 @@ def evaluate_model(
     cycle_count_sum = torch.zeros((), device=device, dtype=torch.int64)
     multi_cycle_count = torch.zeros((), device=device, dtype=torch.int64)
     cycle_window_count = 0
+    segment_settings = _multiscale_segment_settings(model)
+    segment_count_sum = torch.zeros((), device=device, dtype=torch.int64)
+    multi_segment_count = torch.zeros((), device=device, dtype=torch.int64)
+    segment_window_count = 0
     records: list[dict[str, int | float]] = []
     plot_records: list[dict[str, int | float]] = []
     line_handle = prediction_path.open("w", encoding="utf-8") if json_lines else None
@@ -268,6 +330,13 @@ def evaluate_model(
                 cycle_count_sum += observed_cycles.sum()
                 multi_cycle_count += (observed_cycles > 1).sum()
                 cycle_window_count += observed_cycles.numel()
+                if segment_settings is not None:
+                    observed_segments = _observed_segment_counts(
+                        cycle_ids, mask, *segment_settings
+                    )
+                    segment_count_sum += observed_segments.sum()
+                    multi_segment_count += (observed_segments > 1).sum()
+                    segment_window_count += observed_segments.numel()
             targets = batch["target"].to(device, non_blocking=True)
             predictions = model(features, mask, cycle_ids)
             metrics.update(predictions, targets)
@@ -305,6 +374,13 @@ def evaluate_model(
         ).item()
         result["multi_cycle_fraction"] = (
             multi_cycle_count.float() / cycle_window_count
+        ).item()
+    if segment_window_count:
+        result["mean_segments_per_window"] = (
+            segment_count_sum.float() / segment_window_count
+        ).item()
+        result["multi_segment_fraction"] = (
+            multi_segment_count.float() / segment_window_count
         ).item()
     _write_json(result, output_dir / evaluation["metrics_file"])
     if evaluation["plots"]:
@@ -415,6 +491,12 @@ def train_experiment(config: dict[str, Any]) -> dict[str, Any]:
             "train_multi_cycle_fraction": train_metrics.get(
                 "multi_cycle_fraction", 0.0
             ),
+            "train_mean_segments_per_window": train_metrics.get(
+                "mean_segments_per_window", 0.0
+            ),
+            "train_multi_segment_fraction": train_metrics.get(
+                "multi_segment_fraction", 0.0
+            ),
             "validation_mse": validation_metrics["mse"],
             "validation_rmse": validation_metrics["rmse"],
             "validation_mae": validation_metrics["mae"],
@@ -423,6 +505,12 @@ def train_experiment(config: dict[str, Any]) -> dict[str, Any]:
             ),
             "validation_multi_cycle_fraction": validation_metrics.get(
                 "multi_cycle_fraction", 0.0
+            ),
+            "validation_mean_segments_per_window": validation_metrics.get(
+                "mean_segments_per_window", 0.0
+            ),
+            "validation_multi_segment_fraction": validation_metrics.get(
+                "multi_segment_fraction", 0.0
             ),
         }
         history.append(row)
