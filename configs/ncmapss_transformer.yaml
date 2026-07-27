@@ -13,8 +13,8 @@ data:
   split_seed: 42
   rul_cap: 125
   variance_threshold: 1.0e-12
-  batch_size: 128
-  num_workers: 2
+  batch_size: 64
+  num_workers: 8
   pin_memory: true
   options:
     feature_groups: [W, X_s]
