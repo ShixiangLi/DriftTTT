@@ -28,9 +28,11 @@ echo "Examples: FD001,FD002  or  DS01-005,DS02-006"
 read -r -p "Subsets [all]: " SUBSETS
 SUBSETS="${SUBSETS:-all}"
 
-echo "Available mixers: attention, ttt_mlp, ttt_multiscale_moe, all"
+echo "Available mixers: attention, ttt_mlp, ttt_multiscale_moe, cb_dts, all"
 read -r -p "Mixers [all]: " MIXERS
 MIXERS="${MIXERS:-all}"
+
+read -r -p "Training seeds, comma-separated [config default]: " SEEDS
 
 read -r -p "Parallel GPU IDs, comma-separated [serial]: " GPUS
 
@@ -39,6 +41,9 @@ ARGS=(
     --subsets "$SUBSETS"
     --mixers "$MIXERS"
 )
+if [[ -n "$SEEDS" ]]; then
+    ARGS+=(--seeds "$SEEDS")
+fi
 if [[ -n "$GPUS" ]]; then
     ARGS+=(--gpus "$GPUS")
     read -r -p "Concurrent jobs per GPU [1]: " JOBS_PER_GPU

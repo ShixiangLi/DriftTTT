@@ -164,7 +164,8 @@ class RULTransformer(nn.Module):
         features: torch.Tensor,
         mask: torch.Tensor,
         cycle_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_sequence: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if features.ndim != 3 or mask.shape != features.shape[:2]:
             raise ValueError("Expected features [B,L,F] and mask [B,L]")
         if features.shape[-1] != self.input_dim:
@@ -185,6 +186,14 @@ class RULTransformer(nn.Module):
             hidden = block(hidden, mask, cycle_ids)
         positions = torch.arange(mask.shape[1], device=mask.device).expand_as(mask)
         last_indices = positions.masked_fill(~mask, -1).max(dim=1).values
+        if return_sequence:
+            sequence_predictions = self.regression_head(
+                self.final_norm(hidden)
+            ).squeeze(-1)
+            predictions = sequence_predictions[
+                torch.arange(hidden.shape[0], device=hidden.device), last_indices
+            ]
+            return predictions, sequence_predictions
         pooled = hidden[
             torch.arange(hidden.shape[0], device=hidden.device), last_indices
         ]

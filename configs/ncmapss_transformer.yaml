@@ -62,6 +62,9 @@ training:
   max_train_batches: null
   max_validation_batches: null
   plots: true
+  cb_dts:
+    enabled: false
+    weight: 0.5
 
 evaluation:
   checkpoint: null

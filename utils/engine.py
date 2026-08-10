@@ -18,6 +18,7 @@ from data import DatasetBundle, build_dataset_bundle
 from models import RULTransformer
 from utils.complexity import model_complexity
 from utils.config import normalize_config, save_config
+from utils.losses import cycle_balanced_dense_trajectory_loss
 from utils.metrics import RegressionAccumulator
 from utils.visualization import plot_history, plot_predictions
 
@@ -178,8 +179,11 @@ def _run_epoch(
     use_bfloat16: bool,
     max_batches: int | None,
     target_scale: float,
+    cb_dts_weight: float = 0.0,
+    capped_targets: bool = False,
 ) -> dict[str, float | int]:
     training = optimizer is not None
+    use_cb_dts = training and cb_dts_weight > 0.0
     model.train(training)
     metrics = RegressionAccumulator(target_scale=target_scale)
     cycle_count_sum = torch.zeros((), device=device, dtype=torch.int64)
@@ -190,6 +194,8 @@ def _run_epoch(
     multi_segment_count = torch.zeros((), device=device, dtype=torch.int64)
     segment_window_count = 0
     objective_sum = torch.zeros((), device=device)
+    endpoint_objective_sum = torch.zeros((), device=device)
+    trajectory_objective_sum = torch.zeros((), device=device)
     sample_count = 0
     for batch_index, batch in enumerate(loader):
         if max_batches is not None and batch_index >= max_batches:
@@ -216,12 +222,40 @@ def _run_epoch(
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(training):
             with _autocast_context(device, use_bfloat16):
-                predictions = model(features, mask, cycle_ids)
+                model_output = model(
+                    features,
+                    mask,
+                    cycle_ids,
+                    return_sequence=use_cb_dts,
+                )
+            if use_cb_dts:
+                predictions, sequence_predictions = model_output
+            else:
+                if not isinstance(model_output, torch.Tensor):
+                    raise RuntimeError("Endpoint-only model returned sequence output")
+                predictions = model_output
             # Regression loss stays in FP32 so BF16 predictions and FP32 labels
             # cannot create an unsupported mixed-dtype MSE backward graph.
-            loss = nn.functional.mse_loss(
+            endpoint_loss = nn.functional.mse_loss(
                 predictions.float(), targets.float()
             )
+            if use_cb_dts:
+                if cycle_ids is None:
+                    raise ValueError("CB-DTS requires cycle_ids in every batch")
+                trajectory_loss = cycle_balanced_dense_trajectory_loss(
+                    sequence_predictions,
+                    targets,
+                    cycle_ids,
+                    mask,
+                    target_scale=target_scale,
+                    capped_targets=capped_targets,
+                )
+                loss = (
+                    endpoint_loss + float(cb_dts_weight) * trajectory_loss
+                ) / (1.0 + float(cb_dts_weight))
+            else:
+                trajectory_loss = None
+                loss = endpoint_loss
             if training:
                 loss.backward()
                 if gradient_clip is not None and gradient_clip > 0.0:
@@ -229,11 +263,21 @@ def _run_epoch(
                 optimizer.step()
         batch_size = targets.numel()
         objective_sum += loss.detach() * batch_size
+        endpoint_objective_sum += endpoint_loss.detach() * batch_size
+        if trajectory_loss is not None:
+            trajectory_objective_sum += trajectory_loss.detach() * batch_size
         sample_count += batch_size
         metrics.update(predictions, targets)
     result = metrics.compute()
     if training and sample_count:
         result["objective"] = (objective_sum / sample_count).item()
+        result["endpoint_objective"] = (
+            endpoint_objective_sum / sample_count
+        ).item()
+        if use_cb_dts:
+            result["trajectory_objective"] = (
+                trajectory_objective_sum / sample_count
+            ).item()
     if cycle_window_count:
         result["mean_cycles_per_window"] = (
             cycle_count_sum.float() / cycle_window_count
@@ -404,6 +448,8 @@ def train_experiment(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("Resume checkpoint model configuration does not match")
         if saved_config["data"]["name"] != config["data"]["name"]:
             raise ValueError("Resume checkpoint dataset type does not match")
+        if saved_config["training"]["cb_dts"] != training["cb_dts"]:
+            raise ValueError("Resume checkpoint CB-DTS configuration does not match")
 
     bundle = build_dataset_bundle(
         config["data"],
@@ -450,11 +496,17 @@ def train_experiment(config: dict[str, Any]) -> dict[str, Any]:
     print(
         f"device={device} precision={'bf16' if use_bfloat16 else 'fp32'} "
         f"mixer={config['model']['sequence_mixer']} "
+        f"training_method={'cb_dts' if training['cb_dts']['enabled'] else 'endpoint'} "
         f"train_samples={len(bundle.train)} validation_samples={len(bundle.validation)} "
         f"input_dim={bundle.input_dim} parameters={complexity['parameters']:,}"
     )
     best_path = output_dir / "best.pt"
     target_scale = float(config["data"]["rul_cap"] or 1.0)
+    cb_dts_weight = (
+        float(training["cb_dts"]["weight"])
+        if training["cb_dts"]["enabled"]
+        else 0.0
+    )
     started = time.perf_counter()
     for epoch in range(start_epoch, int(training["epochs"]) + 1):
         train_metrics = _run_epoch(
@@ -466,6 +518,8 @@ def train_experiment(config: dict[str, Any]) -> dict[str, Any]:
             use_bfloat16,
             training["max_train_batches"],
             target_scale,
+            cb_dts_weight,
+            config["data"]["rul_cap"] is not None,
         )
         validation_metrics = _run_epoch(
             model,
@@ -483,6 +537,12 @@ def train_experiment(config: dict[str, Any]) -> dict[str, Any]:
                 "objective", train_metrics["mse"]
             ),
             "train_mse": train_metrics["mse"],
+            "train_endpoint_objective": train_metrics.get(
+                "endpoint_objective", train_metrics["mse"]
+            ),
+            "train_trajectory_objective": train_metrics.get(
+                "trajectory_objective", 0.0
+            ),
             "train_rmse": train_metrics["rmse"],
             "train_mae": train_metrics["mae"],
             "train_mean_cycles_per_window": train_metrics.get(

@@ -83,6 +83,13 @@ score. Checkpoints contain model and optimizer states, the normalized
 configuration, feature schema, fitted preprocessing statistics, and entity
 split IDs.
 
+The optional N-CMAPSS batch method `cb_dts` keeps that label-free inner update
+unchanged and adds cycle-balanced dense RUL supervision only to outer
+training. It recovers exact window targets from the endpoint RUL and raw flight
+cycle distance, reuses the shared regression head, and adds no parameters or
+inference work. Validation and testing remain endpoint-only. See
+[`docs/cb_dts.md`](docs/cb_dts.md) for the definition and invariants.
+
 ## Data processing
 
 ### C-MAPSS
@@ -222,8 +229,34 @@ Keep `training.device` and `evaluation.device` set to `auto` (the reference
 default); inside each isolated process the assigned physical GPU appears as
 `cuda:0`.
 
-Use `--dataset all --subsets all --mixers all` for the complete matrix, or add
-`--dry-run` to inspect generated combinations without training. Each batch is
+For N-CMAPSS, `--mixers all` selects `attention`, `ttt_mlp`,
+`ttt_multiscale_moe`, and the training-only `cb_dts` method. CB-DTS maps to the
+same multiscale MoE mixer with its outer loss enabled. It is intentionally not
+created for C-MAPSS.
+
+The requested eight-GPU N-CMAPSS matrix can be launched with:
+
+```bash
+bash run_experiments.sh --dataset ncmapss --subsets all --mixers all --gpus 0,1,2,3,4,5,6,7 --jobs-per-gpu all
+```
+
+Pass one training seed or a comma-separated list with `--seeds`. The data
+`split_seed` remains unchanged, while the selected training seed is written to
+each generated configuration, run-directory suffix, and `summary.csv` row:
+
+```bash
+bash run_experiments.sh --dataset ncmapss --subsets all --mixers all --seeds 7,42,123,202,3407 --gpus 0,1,2,3,4,5,6,7 --jobs-per-gpu 2
+```
+
+Omitting `--seeds` retains the single seed in the dataset YAML and the legacy
+directory naming. The five-seed N-CMAPSS matrix contains 180 jobs. Since
+`--jobs-per-gpu all` would attempt roughly 23 concurrent jobs per GPU for that
+matrix, use an explicit concurrency such as `2` unless GPU memory, host memory,
+and HDF5 bandwidth have been measured for a higher value.
+
+Use `--dataset all --subsets all --mixers all` for the complete applicable
+matrix, or add `--dry-run` to inspect generated combinations without training.
+Each batch is
 grouped under one timestamp directory:
 
 ```text

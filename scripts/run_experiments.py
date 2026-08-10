@@ -25,6 +25,8 @@ BASE_CONFIGS = {
     "cmapss": PROJECT_ROOT / "configs" / "cmapss_transformer.yaml",
     "ncmapss": PROJECT_ROOT / "configs" / "ncmapss_transformer.yaml",
 }
+CB_DTS_METHOD = "cb_dts"
+EXPERIMENT_METHODS = (*MIXER_BUILDERS, CB_DTS_METHOD)
 
 
 def _comma_separated(value: str) -> list[str]:
@@ -32,6 +34,21 @@ def _comma_separated(value: str) -> list[str]:
     if not values:
         raise ValueError("Selection cannot be empty")
     return values
+
+
+def _parse_seeds(value: str) -> list[int]:
+    seeds: list[int] = []
+    for item in _comma_separated(value):
+        try:
+            seed = int(item)
+        except ValueError as error:
+            raise ValueError("seeds must be comma-separated integers") from error
+        if not 0 <= seed < 2**32:
+            raise ValueError("seeds must lie in [0, 2^32)")
+        seeds.append(seed)
+    if len(seeds) != len(set(seeds)):
+        raise ValueError("seeds must be unique")
+    return seeds
 
 
 def _available_cmapss(config: dict[str, Any]) -> dict[str, Path]:
@@ -118,17 +135,25 @@ def _resolve_selections(
 
     requested_mixers = _comma_separated(mixer_selection)
     if len(requested_mixers) == 1 and requested_mixers[0].lower() == "all":
-        mixers = list(MIXER_BUILDERS)
+        mixers = list(EXPERIMENT_METHODS)
     else:
         mixers = [value.lower() for value in requested_mixers]
-        unknown_mixers = sorted(set(mixers) - set(MIXER_BUILDERS))
+        unknown_mixers = sorted(set(mixers) - set(EXPERIMENT_METHODS))
         if unknown_mixers:
             raise ValueError(
-                f"Unknown mixers {unknown_mixers}; available: {list(MIXER_BUILDERS)}"
+                f"Unknown mixers {unknown_mixers}; "
+                f"available: {list(EXPERIMENT_METHODS)}"
             )
+    if datasets == ["cmapss"] and CB_DTS_METHOD in mixers:
+        raise ValueError("cb_dts is supported only for N-CMAPSS")
 
     experiments: list[tuple[str, str, str]] = []
     for dataset in datasets:
+        dataset_mixers = [
+            mixer
+            for mixer in mixers
+            if mixer != CB_DTS_METHOD or dataset == "ncmapss"
+        ]
         if select_all_subsets:
             selected_paths = list(available[dataset].values())
         else:
@@ -145,7 +170,9 @@ def _resolve_selections(
                         print(f"Skipping unusable N-CMAPSS subset {subset}: {problem}")
                         continue
                     raise ValueError(f"N-CMAPSS subset {subset} is unusable: {problem}")
-            experiments.extend((dataset, subset, mixer) for mixer in mixers)
+            experiments.extend(
+                (dataset, subset, mixer) for mixer in dataset_mixers
+            )
     if not experiments:
         raise ValueError("The selections produced no runnable experiments")
     return experiments
@@ -165,16 +192,27 @@ def _new_batch_directory() -> Path:
 
 
 def _experiment_config(
-    dataset: str, subset: str, mixer: str, batch_directory: Path
+    dataset: str,
+    subset: str,
+    mixer: str,
+    batch_directory: Path,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     config = deepcopy(load_config(BASE_CONFIGS[dataset]))
     subset_slug = subset.lower().replace("-", "_")
-    run_name = f"{dataset}_{subset_slug}_{mixer}"
+    seed_suffix = "" if seed is None else f"_seed_{seed}"
+    run_name = f"{dataset}_{subset_slug}_{mixer}{seed_suffix}"
     config["experiment"]["name"] = run_name
     relative_output = batch_directory.relative_to(PROJECT_ROOT) / run_name
     config["experiment"]["output_dir"] = relative_output.as_posix()
     config["data"]["subset"] = subset
-    config["model"]["sequence_mixer"] = mixer
+    is_cb_dts = mixer == CB_DTS_METHOD
+    config["model"]["sequence_mixer"] = (
+        "ttt_multiscale_moe" if is_cb_dts else mixer
+    )
+    config["training"]["cb_dts"]["enabled"] = is_cb_dts
+    if seed is not None:
+        config["training"]["seed"] = seed
     config["training"]["resume"] = None
     config["evaluation"]["checkpoint"] = None
     return normalize_config(config)
@@ -198,6 +236,18 @@ def _write_summary_csv(
                 "dataset": dataset,
                 "subset": subset,
                 "mixer": mixer,
+                "seed": int(config["training"]["seed"]),
+                "sequence_mixer": config["model"]["sequence_mixer"],
+                "training_method": (
+                    "cb_dts"
+                    if config["training"]["cb_dts"]["enabled"]
+                    else "endpoint"
+                ),
+                "cb_dts_weight": (
+                    config["training"]["cb_dts"]["weight"]
+                    if config["training"]["cb_dts"]["enabled"]
+                    else 0.0
+                ),
                 "rmse": metrics["rmse"],
                 "mae": metrics["mae"],
                 "mse": metrics["mse"],
@@ -218,6 +268,8 @@ def _write_summary_csv(
                 "forward_flops_per_sample": complexity["forward_flops_per_sample"],
                 "rmse_delta_vs_attention": "",
                 "rmse_change_percent_vs_attention": "",
+                "rmse_delta_vs_ttt_multiscale_moe": "",
+                "rmse_change_percent_vs_ttt_multiscale_moe": "",
                 "parameter_ratio_vs_attention": "",
                 "mac_ratio_vs_attention": "",
                 "output_dir": config["experiment"]["output_dir"],
@@ -225,25 +277,37 @@ def _write_summary_csv(
         )
 
     attention_rows = {
-        (row["dataset"], row["subset"]): row
+        (row["dataset"], row["subset"], row["seed"]): row
         for row in rows
         if row["mixer"] == "attention"
     }
+    moe_rows = {
+        (row["dataset"], row["subset"], row["seed"]): row
+        for row in rows
+        if row["mixer"] == "ttt_multiscale_moe"
+    }
     for row in rows:
-        baseline = attention_rows.get((row["dataset"], row["subset"]))
-        if baseline is None:
-            continue
-        rmse_delta = float(row["rmse"]) - float(baseline["rmse"])
-        row["rmse_delta_vs_attention"] = rmse_delta
-        row["rmse_change_percent_vs_attention"] = (
-            100.0 * rmse_delta / float(baseline["rmse"])
-        )
-        row["parameter_ratio_vs_attention"] = float(row["parameters"]) / float(
-            baseline["parameters"]
-        )
-        row["mac_ratio_vs_attention"] = float(row["forward_macs_per_sample"]) / float(
-            baseline["forward_macs_per_sample"]
-        )
+        comparison_key = (row["dataset"], row["subset"], row["seed"])
+        baseline = attention_rows.get(comparison_key)
+        if baseline is not None:
+            rmse_delta = float(row["rmse"]) - float(baseline["rmse"])
+            row["rmse_delta_vs_attention"] = rmse_delta
+            row["rmse_change_percent_vs_attention"] = (
+                100.0 * rmse_delta / float(baseline["rmse"])
+            )
+            row["parameter_ratio_vs_attention"] = float(row["parameters"]) / float(
+                baseline["parameters"]
+            )
+            row["mac_ratio_vs_attention"] = float(
+                row["forward_macs_per_sample"]
+            ) / float(baseline["forward_macs_per_sample"])
+        moe_baseline = moe_rows.get(comparison_key)
+        if moe_baseline is not None:
+            moe_delta = float(row["rmse"]) - float(moe_baseline["rmse"])
+            row["rmse_delta_vs_ttt_multiscale_moe"] = moe_delta
+            row["rmse_change_percent_vs_ttt_multiscale_moe"] = (
+                100.0 * moe_delta / float(moe_baseline["rmse"])
+            )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("w", encoding="utf-8-sig", newline="") as handle:
@@ -352,7 +416,18 @@ def main() -> None:
     parser.add_argument(
         "--mixers",
         default="all",
-        help="Comma-separated sequence mixers, or all",
+        help=(
+            "Comma-separated methods (attention, ttt_mlp, "
+            "ttt_multiscale_moe, cb_dts), or all"
+        ),
+    )
+    parser.add_argument(
+        "--seeds",
+        default=None,
+        help=(
+            "One seed or comma-separated training seeds; omitted uses the "
+            "dataset YAML seed"
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -371,9 +446,17 @@ def main() -> None:
     )
     arguments = parser.parse_args()
     try:
-        experiments = _resolve_selections(
+        base_experiments = _resolve_selections(
             arguments.dataset, arguments.subsets, arguments.mixers
         )
+        seeds: list[int | None] = (
+            [None] if arguments.seeds is None else _parse_seeds(arguments.seeds)
+        )
+        experiments = [
+            (dataset, subset, mixer, seed)
+            for dataset, subset, mixer in base_experiments
+            for seed in seeds
+        ]
         gpus = None if arguments.gpus is None else _parse_gpus(arguments.gpus)
         if gpus is None:
             if arguments.jobs_per_gpu != "1":
@@ -390,16 +473,27 @@ def main() -> None:
     generated_root = batch_directory / "configs"
     planned: list[tuple[str, str, str, dict[str, Any], Path]] = []
     print(f"Selected {len(experiments)} experiment(s)")
+    print(
+        "Training seeds: "
+        + (
+            "dataset configuration default"
+            if arguments.seeds is None
+            else ",".join(str(seed) for seed in seeds)
+        )
+    )
     print(f"Batch directory: {batch_directory.relative_to(PROJECT_ROOT)}")
-    for index, (dataset, subset, mixer) in enumerate(experiments, start=1):
-        config = _experiment_config(dataset, subset, mixer, batch_directory)
+    for index, (dataset, subset, mixer, seed) in enumerate(experiments, start=1):
+        config = _experiment_config(
+            dataset, subset, mixer, batch_directory, seed
+        )
         run_name = config["experiment"]["name"]
         config_path = generated_root / f"{run_name}.yaml"
         planned.append((dataset, subset, mixer, config, config_path))
         save_config(config, config_path)
         print(
             f"[{index}/{len(experiments)}] dataset={dataset} subset={subset} "
-            f"mixer={mixer} output={config['experiment']['output_dir']}"
+            f"mixer={mixer} seed={config['training']['seed']} "
+            f"output={config['experiment']['output_dir']}"
         )
     if not arguments.dry_run:
         if gpus is None:

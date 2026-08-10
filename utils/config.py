@@ -66,6 +66,10 @@ DEFAULTS: dict[str, Any] = {
         "max_train_batches": None,
         "max_validation_batches": None,
         "plots": True,
+        "cb_dts": {
+            "enabled": False,
+            "weight": 0.5,
+        },
     },
     "evaluation": {
         "checkpoint": None,
@@ -246,6 +250,20 @@ def normalize_config(raw: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{section_name}.device is invalid: {device}")
     if training["precision"] not in {"auto", "fp32", "bf16"}:
         raise ValueError("training.precision must be auto, fp32, or bf16")
+    cb_dts = training["cb_dts"]
+    if not isinstance(cb_dts["enabled"], bool):
+        raise ValueError("training.cb_dts.enabled must be a boolean")
+    cb_dts_weight = float(cb_dts["weight"])
+    if not 0.0 <= cb_dts_weight <= 1.0:
+        raise ValueError("training.cb_dts.weight must be in [0, 1]")
+    cb_dts["weight"] = cb_dts_weight
+    if cb_dts["enabled"]:
+        if cb_dts_weight <= 0.0:
+            raise ValueError("Enabled CB-DTS requires a positive weight")
+        if data["name"] != "ncmapss":
+            raise ValueError("CB-DTS is supported only for N-CMAPSS")
+        if model["sequence_mixer"] != "ttt_multiscale_moe":
+            raise ValueError("CB-DTS requires model.sequence_mixer=ttt_multiscale_moe")
     for section_name, key in (
         ("training", "max_train_batches"),
         ("training", "max_validation_batches"),

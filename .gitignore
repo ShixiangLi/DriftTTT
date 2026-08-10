@@ -4,6 +4,8 @@ raw_data/
 processed_data/
 ViTTT/
 tennessee-eastman-profbraatz/
+docs/
+tests/
 
 venv/
 .venv/
