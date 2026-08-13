@@ -4,7 +4,8 @@ raw_data/
 processed_data/
 ViTTT/
 tennessee-eastman-profbraatz/
-docs/
+docs/*
+!docs/ncmapss_method_and_results_zh.md
 tests/
 
 venv/
