@@ -30,14 +30,14 @@
 输入先经过线性投影和位置编码：
 
 $$
-Z^{(0)}=\operatorname{Linear}(X)+\operatorname{PE},
+Z^{(0)}=\mathrm{Linear}(X)+\mathrm{PE},
 \qquad Z^{(0)}\in\mathbb{R}^{B\times L\times D}.
 $$
 
 随后通过 4 个 Transformer Block。每个 Block 中的序列混合器可以替换为 Attention、标准 TTT 或 TTT-MoE，其余前馈网络和残差结构保持一致。最后，共享回归头对每个位置都能产生一个标量：
 
 $$
-\hat Y=\operatorname{Head}(Z),
+\hat Y=\mathrm{Head}(Z),
 \qquad \hat Y\in\mathbb{R}^{B\times L}.
 $$
 
@@ -54,7 +54,7 @@ $$
 对某一 Transformer Block 的输入 \(Z\in\mathbb{R}^{B\times L\times D}\) 做一次线性投影并拆成 \(H\) 个头：
 
 $$
-Q,K,V=\operatorname{split}(W_{qkv}Z),
+Q,K,V=\mathrm{split}(W_{qkv}Z),
 \qquad Q,K,V\in\mathbb{R}^{B\times L\times H\times d}.
 $$
 
@@ -92,7 +92,7 @@ $$
 
 $$
 L_{\mathrm{TTT}}(\theta)
-=\operatorname{mean}\left\|f_\theta(K)-(V-K)\right\|^2.
+=\mathrm{mean}\left\|f_\theta(K)-(V-K)\right\|^2.
 $$
 
 然后在当前样本上做内部梯度更新：
@@ -123,15 +123,15 @@ $$
 模型为每个样本、时间点和头计算一个短期权重：
 
 $$
-g=\operatorname{sigmoid}\left(\frac{Q\cdot w_g}{\sqrt d}+b_g\right),
+g=\mathrm{sigmoid}\left(\frac{Q\cdot w_g}{\sqrt d}+b_g\right),
 \qquad g\in\mathbb{R}^{B\times L\times H}.
 $$
 
-设短期容量占比 \(p=M_s/M\)，\(\operatorname{Center}(\cdot)\) 表示在有效时间点上减去均值。代码中的实际融合为：
+设短期容量占比 \(p=M_s/M\)，\(\mathrm{Center}(\cdot)\) 表示在有效时间点上减去均值。代码中的实际融合为：
 
 $$
 R=\frac{g}{p}r_s+
-\operatorname{Center}\left(\frac{1-g}{1-p}r_l\right),
+\mathrm{Center}\left(\frac{1-g}{1-p}r_l\right),
 \qquad H_{\mathrm{mix}}=Q+R.
 $$
 
