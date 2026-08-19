@@ -1,352 +1,238 @@
-# DriftTTT
+# DriftTTT 执行说明
 
-DriftTTT is a PyTorch project for remaining-useful-life (RUL) prediction on
-NASA C-MAPSS and N-CMAPSS. It uses one Transformer encoder backbone with a
-configuration-selected sequence mixer. The current mixers are standard
-self-attention, a test-time-training MLP (`ttt_mlp`), and a fixed-rank
-multiscale TTT mixture of experts (`ttt_multiscale_moe`).
+本文档只说明项目的安装、训练、评估和批量运行方法。算法说明见 [docs/ncmapss_method_and_results_zh.md](docs/ncmapss_method_and_results_zh.md)。
 
-## Current model
+## 1. 环境准备
 
-The model maps input windows from `[B,L,F]` to `[B,L,d_model]`, adds dynamic
-sinusoidal positions, and applies shared Transformer blocks. Every block has
-the same normalization, residual, feed-forward, and masking path; only its
-sequence mixer changes. The last valid timestep is normalized and passed to a
-scalar RUL regression head.
+项目要求 Python 3.10 及以上版本。
 
-Select the mixer in either dataset configuration:
+Linux 服务器：
+
+```bash
+cd /home/lsx/workspace/DriftTTT
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Windows：
+
+```powershell
+cd F:\workspace\py\llm\DriftTTT
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+根目录下的 `run_experiments.sh` 和 `run_experiments.bat` 会自动使用项目虚拟环境，批量运行时不必提前激活环境。
+
+## 2. 数据目录
+
+将数据放在以下位置：
+
+```text
+dataset/
+├─ cmapss/       C-MAPSS 数据文件
+└─ n-cmapss/     N-CMAPSS HDF5 数据文件
+```
+
+默认配置文件：
+
+```text
+configs/cmapss_transformer.yaml
+configs/ncmapss_transformer.yaml
+```
+
+## 3. 单次训练
+
+训练 C-MAPSS：
+
+```bash
+.venv/bin/python -m scripts.train --config configs/cmapss_transformer.yaml
+```
+
+训练 N-CMAPSS：
+
+```bash
+.venv/bin/python -m scripts.train --config configs/ncmapss_transformer.yaml
+```
+
+Windows 将 `.venv/bin/python` 替换为 `.\.venv\Scripts\python.exe`：
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.train --config configs\ncmapss_transformer.yaml
+```
+
+单次训练使用 YAML 中的 `model.sequence_mixer`：
 
 ```yaml
 model:
   sequence_mixer: ttt_multiscale_moe
 ```
 
-`attention` uses standard multi-head self-attention. `ttt_mlp` projects
-queries, keys, and values per head and treats a two-layer MLP as sample-local
-fast state. Its label-free inner objective always reconstructs `value - key`
-from the same-time key. For each configured chunk, it takes one differentiable
-inner gradient step and applies the updated MLP to queries. Fast weights start
-from learned outer parameters, remain separate for every sample, and are
-discarded after each forward call. They are never written back or shared
-across batches. TTT inner updates stay in FP32 under mixed precision.
+可选值：
 
-`ttt_multiscale_moe` partitions the same fast-MLP hidden rank between a short
-expert and a long expert instead of constructing two complete networks. The
-long clock splits valid observations into configurable fixed-size contiguous
-segments and averages Q, K, and V inside each segment. N-CMAPSS segments reset
-at physical flight-cycle boundaries, using independent integer cycle metadata
-rather than the normalized cycle feature. The short expert receives each
-base-token Q/K/V minus its segment mean, while the long expert receives the
-ordered segment means. Each long result is mapped back to its source
-observations, and a lightweight per-head gate fuses both outputs. QKV, output
-projections, and the total fast-MLP rank remain shared and fixed. Both experts
-use the same stable reconstruction objective at their respective clocks. The
-final gated long contribution can be centered over valid observations, so it
-expresses relative slow variation without replacing the absolute-health query
-path. A sample with fewer than two segments automatically bypasses the long
-correction. Short- and long-expert fast states are sample-local and discarded
-after every window.
+- `attention`：标准 Attention；
+- `ttt_mlp`：标准 TTT Layer；
+- `ttt_multiscale_moe`：TTT-MoE。
 
-All TTT-MLP settings live in the same YAML:
+CB-DTS 建议通过批量入口中的 `--mixers cb_dts` 启动，脚本会自动选择 TTT-MoE 并开启 CB-DTS 训练损失。
 
-```yaml
-model:
-  ttt:
-    hidden_multiplier: 2.0
-    inner_learning_rate: 0.1
-    chunk_size: 16
-    inner_gradient_clip: 1.0
-    activation: silu
-    qkv_bias: true
-    multiscale:
-      short_rank_ratio: 0.5
-      long_segment_size: 64
-      reset_segment_on_cycle: true
-      long_update_interval: 3
-      long_inner_learning_rate: 0.025
-      center_long_residual: true
+## 4. 单次评估与绘图
+
+评估配置对应的检查点：
+
+```bash
+.venv/bin/python -m scripts.evaluate --config configs/ncmapss_transformer.yaml
 ```
 
-The common `inner_learning_rate` and `chunk_size` configure short-expert
-updates. `long_segment_size` is the maximum number of valid observations
-averaged into one long token. `reset_segment_on_cycle=true` starts a fresh
-segment at each physical cycle transition; N-CMAPSS enables it so a segment
-never merges adjacent flights. C-MAPSS disables it because each lifecycle cycle
-has only one row. `long_update_interval` is the number of segment states in one
-long update. `center_long_residual=false` provides the absolute-offset
-ablation. These multiscale values are ignored by `attention` and `ttt_mlp`.
+根据已有实验目录重新绘图：
 
-All TTT mixers use only the label-free same-coordinate reconstruction task
-during their inner update. RUL labels are used exclusively by the outer
-regression loss. Evaluation reports RMSE, MAE, MSE, and the asymmetric NASA
-score. Checkpoints contain model and optimizer states, the normalized
-configuration, feature schema, fitted preprocessing statistics, and entity
-split IDs.
+```bash
+.venv/bin/python -m scripts.visualize --run-dir outputs/实验目录名
+```
 
-The optional N-CMAPSS batch method `cb_dts` keeps that label-free inner update
-unchanged and adds cycle-balanced dense RUL supervision only to outer
-training. It recovers exact window targets from the endpoint RUL and raw flight
-cycle distance, reuses the shared regression head, and adds no parameters or
-inference work. Validation and testing remain endpoint-only. See
-[`docs/cb_dts.md`](docs/cb_dts.md) for the definition and invariants.
-
-## Data processing
-
-### C-MAPSS
-
-Place the official files under `dataset/cmapss/`. All four subsets are
-supported: FD001, FD002, FD003, and FD004.
-
-- Official training engines are split into disjoint train/validation engines.
-- Variance selection and standardization are fitted only on training engines.
-- Windows never cross engine boundaries.
-- Training and validation labels are `max_cycle - current_cycle`.
-- The configured piecewise RUL cap is applied consistently to every split;
-  targets are divided by the cap for optimization and restored for reporting.
-- `options.include_cycle` adds the observed lifecycle cycle as a feature; its
-  normalization is fitted only on training engines.
-- Integer cycle IDs are also returned as non-feature metadata, regardless of
-  `include_cycle`.
-- Official testing uses the final observed window and supplied `RUL_FD*.txt`
-  target for each test engine.
-
-Trajectory columns are interpreted as engine ID, cycle, three operating
-settings, and 21 sensor measurements. Engine ID is never a model feature.
-
-### N-CMAPSS
-
-Place the official HDF5 files under `dataset/n-cmapss/`. A subset is loaded
-lazily, so feature windows are read on demand rather than materializing a
-multi-gigabyte file in memory.
-
-- Development units are split into disjoint train/validation units.
-- Official test units never contribute preprocessing statistics.
-- Statistics are fitted incrementally from chunks of training-unit rows.
-- The default observed inputs are `W` and `X_s`; `X_v` may be enabled.
-- Health parameters in `T` are rejected as inputs to avoid target leakage.
-- Windows stay inside a unit and can downsample the original 1 Hz stream.
-- `options.include_cycle` adds the observed flight cycle from `A` as a
-  train-statistics-normalized lifecycle-position feature.
-- The same raw cycle column is returned separately as integer metadata for
-  resetting long-expert segment boundaries; it is never normalized or exposed
-  as an extra feature.
-- `data.options.include_partial_windows` controls one shared train/validation/test
-  policy and defaults to `false`, so all splits use complete windows.
-- Test predictions cover each unit trajectory at `evaluation_stride`, plus its
-  final row, and are streamed to JSON Lines.
-
-The adapter checks required datasets, aligned row counts, feature names, and
-contiguous unit spans before training.
-
-RMSE, MAE, MSE, NASA Score, prediction files, and plots are all reported in
-the original RUL unit even though capped labels are normalized during training.
-
-The current local `N-CMAPSS_DS08d-010.h5` file has inconsistent HDF5 end-of-file
-metadata and is not usable. An `all` batch skips unreadable files with a
-diagnostic. The reference configuration uses DS02-006 and is unaffected.
-
-## Setup
-
-The existing virtual environment can be used directly:
+Windows 示例：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m scripts.evaluate --config configs\ncmapss_transformer.yaml
+.\.venv\Scripts\python.exe -m scripts.visualize --run-dir outputs\实验目录名
 ```
 
-Python 3.10 or newer and the direct dependencies in `pyproject.toml` are
-supported.
+## 5. Linux 服务器批量实验
 
-## Training
+服务器上的批量实验统一从 shell 脚本启动：
 
-C-MAPSS FD004 experiment:
-
-```powershell
-.\.venv\Scripts\python.exe -m scripts.train --config configs\cmapss_transformer.yaml
+```bash
+cd /home/lsx/workspace/DriftTTT
+bash run_experiments.sh [参数]
 ```
 
-N-CMAPSS DS02 experiment:
-
-```powershell
-.\.venv\Scripts\python.exe -m scripts.train --config configs\ncmapss_transformer.yaml
-```
-
-### Batch experiments
-
-The repository-root launchers build a Cartesian product of selected subsets
-and sequence mixers. Run either launcher without arguments for interactive
-prompts:
-
-```powershell
-.\run_experiments.bat
-```
+不带参数运行时，脚本会交互式询问数据集、子集、方法、seed 和 GPU：
 
 ```bash
 bash run_experiments.sh
 ```
 
-Selections can also be passed directly. For example, compare the original and
-multiscale TTT mixers on two C-MAPSS subsets:
+常用参数：
+
+| 参数 | 说明 | 示例 |
+|---|---|---|
+| `--dataset` | `cmapss`、`ncmapss` 或 `all` | `--dataset ncmapss` |
+| `--subsets` | 一个、多个或全部子集 | `--subsets DS02-006,DS05` |
+| `--mixers` | 一个、多个或全部方法 | `--mixers attention,ttt_multiscale_moe` |
+| `--seeds` | 一个或多个训练 seed | `--seeds 7,42,123,202,3407` |
+| `--gpus` | 并行使用的 GPU 编号 | `--gpus 0,1,2,3` |
+| `--jobs-per-gpu` | 每张 GPU 同时运行的任务数，或 `all` | `--jobs-per-gpu 2` |
+| `--dry-run` | 只生成配置，不开始训练 | `--dry-run` |
+
+`--mixers` 可选：`attention`、`ttt_mlp`、`ttt_multiscale_moe`、`cb_dts`、`all`。其中 `cb_dts` 只用于 N-CMAPSS。
+
+### 5.1 N-CMAPSS 全子集、全方法、五个 seed
+
+建议先限制每张 GPU 的并发数：
+
+```bash
+bash run_experiments.sh \
+  --dataset ncmapss \
+  --subsets all \
+  --mixers all \
+  --seeds 7,42,123,202,3407 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --jobs-per-gpu 2
+```
+
+如果已经确认 GPU 显存、主机内存和 HDF5 读取带宽足够，可以让脚本自动把全部任务尽量并发分配：
+
+```bash
+bash run_experiments.sh \
+  --dataset ncmapss \
+  --subsets all \
+  --mixers all \
+  --seeds 7,42,123,202,3407 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --jobs-per-gpu all
+```
+
+### 5.2 指定 N-CMAPSS 子集和方法
+
+```bash
+bash run_experiments.sh \
+  --dataset ncmapss \
+  --subsets DS02-006,DS05 \
+  --mixers attention,ttt_mlp,ttt_multiscale_moe,cb_dts \
+  --seeds 42,202 \
+  --gpus 0,1,2,3 \
+  --jobs-per-gpu 1
+```
+
+### 5.3 C-MAPSS 全子集对比
+
+```bash
+bash run_experiments.sh \
+  --dataset cmapss \
+  --subsets all \
+  --mixers attention,ttt_mlp,ttt_multiscale_moe \
+  --seeds 7,42,123,202,3407 \
+  --gpus 0,1,2,3 \
+  --jobs-per-gpu 2
+```
+
+### 5.4 运行前检查任务矩阵
+
+下面的命令只生成本轮配置并打印任务，不执行训练：
+
+```bash
+bash run_experiments.sh \
+  --dataset ncmapss \
+  --subsets all \
+  --mixers all \
+  --seeds 7,42,123,202,3407 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --jobs-per-gpu 2 \
+  --dry-run
+```
+
+## 6. Windows 批量实验
+
+交互式运行：
 
 ```powershell
-.\run_experiments.bat --dataset cmapss --subsets FD001,FD002 --mixers ttt_mlp,ttt_multiscale_moe
+.\run_experiments.bat
 ```
 
-```bash
-bash run_experiments.sh --dataset cmapss --subsets FD001,FD002 --mixers ttt_mlp,ttt_multiscale_moe
-```
-
-Run TTT-MLP on every usable N-CMAPSS file:
+直接传入参数：
 
 ```powershell
-.\run_experiments.bat --dataset ncmapss --subsets all --mixers ttt_mlp
+.\run_experiments.bat `
+  --dataset ncmapss `
+  --subsets all `
+  --mixers all `
+  --seeds 7,42,123,202,3407 `
+  --gpus 0,1,2,3 `
+  --jobs-per-gpu 1
 ```
 
-On a four-GPU server, add `--gpus 0,1,2,3` to run at most four independent
-experiments concurrently, with one process isolated to each GPU:
+## 7. 输出目录
 
-```bash
-bash run_experiments.sh --dataset cmapss --subsets all --mixers attention,ttt_mlp --gpus 0,1,2,3
-```
-
-If memory permits multiple experiments on each GPU, set a numeric concurrency
-or use `all`. For the eight C-MAPSS combinations below, `all` resolves to two
-jobs per GPU and starts the complete matrix concurrently:
-
-```bash
-bash run_experiments.sh --dataset cmapss --subsets all --mixers attention,ttt_mlp --gpus 0,1,2,3 --jobs-per-gpu all
-```
-
-Use `--jobs-per-gpu 2` for an explicit two jobs per GPU. This is a trust-based
-capacity setting rather than dynamic memory reservation; choose it only after
-confirming peak memory usage. Running many N-CMAPSS jobs together can also be
-limited by HDF5 storage bandwidth and host memory even when GPU memory is free.
-
-The same option works with the Windows launcher. Without `--gpus`, execution
-remains serial, and `--gpus` alone defaults to one job per GPU. Parallel console
-output is written to `train.log` inside each experiment directory so messages
-from different processes do not interleave.
-Keep `training.device` and `evaluation.device` set to `auto` (the reference
-default); inside each isolated process the assigned physical GPU appears as
-`cuda:0`.
-
-For N-CMAPSS, `--mixers all` selects `attention`, `ttt_mlp`,
-`ttt_multiscale_moe`, and the training-only `cb_dts` method. CB-DTS maps to the
-same multiscale MoE mixer with its outer loss enabled. It is intentionally not
-created for C-MAPSS.
-
-The requested eight-GPU N-CMAPSS matrix can be launched with:
-
-```bash
-bash run_experiments.sh --dataset ncmapss --subsets all --mixers all --gpus 0,1,2,3,4,5,6,7 --jobs-per-gpu all
-```
-
-Pass one training seed or a comma-separated list with `--seeds`. The data
-`split_seed` remains unchanged, while the selected training seed is written to
-each generated configuration, run-directory suffix, and `summary.csv` row:
-
-```bash
-bash run_experiments.sh --dataset ncmapss --subsets all --mixers all --seeds 7,42,123,202,3407 --gpus 0,1,2,3,4,5,6,7 --jobs-per-gpu 2
-```
-
-Omitting `--seeds` retains the single seed in the dataset YAML and the legacy
-directory naming. The five-seed N-CMAPSS matrix contains 180 jobs. Since
-`--jobs-per-gpu all` would attempt roughly 23 concurrent jobs per GPU for that
-matrix, use an explicit concurrency such as `2` unless GPU memory, host memory,
-and HDF5 bandwidth have been measured for a higher value.
-
-Use `--dataset all --subsets all --mixers all` for the complete applicable
-matrix, or add `--dry-run` to inspect generated combinations without training.
-Each batch is
-grouped under one timestamp directory:
+批量实验统一保存在时间戳目录下：
 
 ```text
 outputs/batches/YYYYMMDD_HHMMSS/
-  configs/                        generated launch configurations
-  cmapss_fd001_attention/         complete attention run
-  cmapss_fd001_ttt_mlp/           complete TTT-MLP run
-  cmapss_fd001_ttt_multiscale_moe/ complete multiscale TTT run
-  ...
-  summary.csv                     accuracy and complexity comparison
+├─ configs/       本批次自动生成的配置
+├─ 各实验目录/    检查点、指标、预测和图片
+└─ summary.csv    本批次汇总结果
 ```
 
-`summary.csv` records RMSE, MAE, MSE, NASA Score, observed cycles and long
-segments per window, multi-cycle and multi-segment coverage, parameter counts,
-analytical per-sample MACs/FLOPs, and differences or ratios relative to
-attention for the same dataset subset. The segment fields make long-expert
-activation coverage explicit. The MoE estimate uses the nominal
-`ceil(window_size / long_segment_size)` slow length; cycle-boundary resets can
-add a small data-dependent number of segment tokens. It does not model
-Python-loop, synchronization, or kernel-launch overhead. An unreadable N-CMAPSS
-HDF5 file is rejected when selected explicitly and skipped with a diagnostic
-message during an `all` run.
-
-Change `model.sequence_mixer` in the same file to compare `attention`,
-`ttt_mlp`, and `ttt_multiscale_moe` while retaining the identical data split,
-model backbone, optimizer, metrics, and evaluation protocol. Also change
-`experiment.name` and `experiment.output_dir` so runs do not overwrite one
-another. The command trains the model, restores the best validation checkpoint,
-and evaluates the official test split.
-
-`training.precision: auto` selects BF16 on a compatible CUDA device and FP32
-otherwise. Model parameters, optimization, and TTT fast-weight updates remain
-FP32. Batch limits are available for integration smoke runs; metrics from
-partial runs are not benchmark-comparable.
-
-To resume, set `training.resume` to the prior `last.pt`, retain the same output
-directory, and increase `training.epochs` to the desired total epoch count.
-
-## Evaluation and visualization
-
-Evaluate the configured checkpoint, or `best.pt` in the output directory when
-`evaluation.checkpoint` is null:
-
-```powershell
-.\.venv\Scripts\python.exe -m scripts.evaluate --config configs\cmapss_transformer.yaml
-```
-
-Regenerate plots from saved JSON/JSONL output:
-
-```powershell
-.\.venv\Scripts\python.exe -m scripts.visualize --run-dir outputs\cmapss_fd004_ttt_multiscale_moe
-```
-
-Each completed run contains:
+单个完整实验通常包含：
 
 ```text
-best.pt                 best validation-MSE checkpoint
-last.pt                 latest checkpoint and optimizer state
-config.yaml             normalized run configuration
-history.json            epoch-level training and validation metrics
-test_metrics.json       RUL metrics and complexity summary
-test_predictions.json   C-MAPSS endpoint predictions
-test_predictions.jsonl  N-CMAPSS streamed trajectory predictions
-training_history.png    loss/RMSE curves
-test_predictions.png    prediction sequence and parity plots
+best.pt
+last.pt
+config.yaml
+history.json
+test_metrics.json
+test_predictions.json 或 test_predictions.jsonl
+training_history.png
+test_predictions.png
+train.log
 ```
 
-## Project layout
-
-```text
-configs/
-  cmapss_transformer.yaml
-  ncmapss_transformer.yaml
-data/
-  base.py               shared dataset bundle contract
-  preprocessing.py      streaming statistics and feature scaler
-  cmapss.py             C-MAPSS parsing, split, labels, and windows
-  ncmapss.py            lazy HDF5 schema, split, scaling, and windows
-  registry.py           explicit adapter selection
-models/
-  rul_transformer.py    shared Transformer blocks and mixer registry
-  ttt_layer.py          shared TTT core, standard MLP, and multiscale MoE
-utils/
-  config.py             strict YAML loading and validation
-  complexity.py         parameter and analytical operation counts
-  metrics.py            regression and NASA metrics
-  engine.py             training, evaluation, and checkpoints
-  visualization.py      training and prediction figures
-scripts/
-  train.py
-  evaluate.py
-  visualize.py
-```
+如需断点续训，在对应 YAML 中设置 `training.resume` 为已有的 `last.pt`，保持原输出目录不变，并把 `training.epochs` 调整为期望的总 epoch 数。
